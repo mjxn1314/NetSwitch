@@ -1,0 +1,13 @@
+# 配置档案（含个人网络信息，不上传）
+ip_profiles.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.tmp
+*.log
+
+# 打包产物
+build/
+dist/
+*.spec
