@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-IP 地址切换工具（Windows）v1.3
+NetSwitch（IP 快切）Windows v1.4
 ================================
 功能：
   1. 快速枚举网卡（CIM，约 0.5 秒），显示 IP / 掩码 / 网关 / DNS / DHCP 状态
@@ -8,14 +8,16 @@ IP 地址切换工具（Windows）v1.3
   3. 设置静态 IP：主 IP、子网掩码、默认网关、首选/备用 DNS
   4. 支持【同一张网卡绑定多个 IP】，可添加任意数量的附加 IP
   5. 档案不绑定网卡，可对当前选定的任意网卡一键应用
-  6. 档案右键菜单：编辑、一键应用、删除
+  6. 档案右键菜单：编辑（独立窗口）、一键应用、删除
   7. 安全写入：netsh 即时生效，设置失败不破坏现有配置
-  8. 窗口自适应屏幕大小，可自由缩放
+  8. 【静态路由】查看系统/网卡的永久、临时路由，可添加、删除永久或临时路由
+  9. 配置文件统一存放在「文档\\NetSwitch\\」，程序目录不再显示
+ 10. 窗口自适应屏幕大小，可自由缩放
 
 注意：
-  - 修改 IP 需要【管理员权限】，请使用同目录下的「启动工具.bat」运行
+  - 修改 IP / 路由需要【管理员权限】，请使用同目录下的「启动工具.bat」运行
   - 附加 IP 不设置默认网关（一张网卡只有一个默认网关，作用于主 IP）
-  - 档案文件 ip_profiles.json 保存在程序同目录
+  - 档案文件 ip_profiles.json 存放在「文档\\NetSwitch\\」目录
 """
 
 import os
@@ -32,13 +34,71 @@ from tkinter import ttk, messagebox
 # ---------------------------------------------------------------------------
 # 路径
 # ---------------------------------------------------------------------------
-APP_TITLE = "NetSwitch - IP 快切 v1.3"
+APP_TITLE = "NetSwitch - IP 快切 v1.4"
+
+# 现代浅色配色
+BG = "#eef2f8"          # 窗口背景（浅蓝灰）
+CARD = "#ffffff"        # 卡片背景
+PRIMARY = "#2563eb"     # 主色（蓝）
+PRIMARY_DARK = "#1d4ed8"
+ACCENT = "#06b6d4"       # 强调（青）
+TEXT = "#1e293b"
+MUTED = "#64748b"
+BORDER = "#d7dee9"
+HEADER_BG = "#f1f5f9"
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "ip_profiles.json")
+
+
+def get_documents_dir():
+    """获取系统『文档』文件夹（SHGetKnownFolderPath，兼容文档被重定向到 OneDrive 等）。"""
+    try:
+        import ctypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        # FOLDERID_Documents = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+        fid = GUID(0xFDD39AD0, 0x238F, 0x46AF,
+                   (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85,
+                                        0x48, 0x03, 0x69, 0xC7))
+        path = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(fid), 0, None, ctypes.byref(path)) == 0:
+            return path.value
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Documents")
+
+
+# 配置统一存放在 文档\NetSwitch\ 下，程序目录不再显示配置文件
+APP_DATA_DIR = os.path.join(get_documents_dir(), "NetSwitch")
+try:
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+CONFIG_PATH = os.path.join(APP_DATA_DIR, "ip_profiles.json")
+
+
+def migrate_old_config():
+    """首次运行：若程序目录存在旧 ip_profiles.json，迁移到文档目录。"""
+    old = os.path.join(BASE_DIR, "ip_profiles.json")
+    if os.path.exists(old) and not os.path.exists(CONFIG_PATH):
+        try:
+            os.replace(old, CONFIG_PATH)
+        except Exception:
+            pass
+
+
+migrate_old_config()
 
 COMMON_MASKS = [
     "255.255.255.0",
@@ -73,6 +133,19 @@ def is_admin():
         return False
 
 
+# 子进程隐藏窗口参数：CREATE_NO_WINDOW + STARTUPINFO(SW_HIDE)，避免刷新/操作时闪黑框/蓝框
+def hidden_startup():
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    return {
+        "creationflags": 0x08000000,  # CREATE_NO_WINDOW
+        "startupinfo": si,
+    }
+
+
 def run_ps(script: str, timeout: int = 60):
     """以 EncodedCommand 方式执行 PowerShell。"""
     full = (
@@ -92,6 +165,7 @@ def run_ps(script: str, timeout: int = 60):
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+            **hidden_startup(),
         )
         text = (p.stdout or "").strip()
         if not text:
@@ -113,12 +187,32 @@ def run_netsh(args, timeout: int = 60):
             timeout=timeout,
             encoding="gbk",
             errors="replace",
+            **hidden_startup(),
         )
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except subprocess.TimeoutExpired:
         return -1, "netsh 执行超时"
     except Exception as e:
         return -1, f"无法启动 netsh：{e}"
+
+
+def run_route(args, timeout: int = 60):
+    """执行 route.exe 命令，返回 (returncode, output)。"""
+    try:
+        p = subprocess.run(
+            ["route"] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="gbk",
+            errors="replace",
+            **hidden_startup(),
+        )
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return -1, "route 执行超时"
+    except Exception as e:
+        return -1, f"无法启动 route：{e}"
 
 
 def ps_quote(s):
@@ -282,6 +376,145 @@ def get_adapters():
 
 
 # ---------------------------------------------------------------------------
+# 静态路由（读取 / 添加 / 删除）
+# ---------------------------------------------------------------------------
+ROUTE_MASKS = [
+    "255.255.255.255",
+    "255.255.255.0",
+    "255.255.255.252",
+    "255.255.255.248",
+    "255.255.255.240",
+    "255.255.255.224",
+    "255.255.255.192",
+    "255.255.255.128",
+    "255.255.254.0",
+    "255.255.255.0",
+    "255.255.0.0",
+    "255.0.0.0",
+]
+
+GET_ROUTES_PS = r"""
+# 永久路由：直接读注册表 PersistentRoutes（值名格式：目标,掩码,网关）
+$persist = @{}
+$pr = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes' -ErrorAction SilentlyContinue
+if ($pr) {
+    foreach ($prop in $pr.PSObject.Properties) {
+        if ($prop.Name -notmatch '^[^,]+,[^,]+,[^,]+$') { continue }
+        $parts = $prop.Name -split ','
+        $key = ($parts[0] + '|' + $parts[1] + '|' + $parts[2])
+        $persist[$key] = $true
+    }
+}
+
+# 活动路由（ActiveStore）
+$active = Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+$list = @()
+foreach ($r in $active) {
+    $dp = [string]$r.DestinationPrefix
+    $seg = $dp -split '/'
+    $dest = $seg[0]
+    $prefix = 0
+    [void][int]::TryParse($seg[1], [ref]$prefix)
+
+    $gw = [string]$r.NextHop
+    $mask = ''
+    if ($seg[1] -match '^\d+$') {
+        $bits = '1' * [int]$seg[1] + '0' * (32 - [int]$seg[1])
+        $oct = @()
+        for ($i=0; $i -lt 32; $i += 8) { $oct += [string]([Convert]::ToInt32($bits.Substring($i,8),2)) }
+        $mask = $oct -join '.'
+    }
+
+    $key = ($dest + '|' + $mask + '|' + $gw)
+    $isPersist = $persist.ContainsKey($key)
+    # 若掩码未完全匹配，再用 目标+网关 兜底判断
+    if (-not $isPersist) {
+        foreach ($k in $persist.Keys) {
+            $ks = $k -split '\|'
+            if ($ks[0] -eq $dest -and $ks[2] -eq $gw) { $isPersist = $true; break }
+        }
+    }
+
+    $list += [PSCustomObject]@{
+        dest=$dest
+        prefix=$prefix
+        mask=$mask
+        gw=$gw
+        iface=[string]$r.InterfaceAlias
+        ifIndex=[int]$r.InterfaceIndex
+        metric=[int]$r.RouteMetric
+        persist=[bool]$isPersist
+    }
+}
+if ($list.Count -gt 0) { $list | ConvertTo-Json -Depth 4 -Compress } else { '[]' }
+"""
+
+
+def get_routes():
+    """返回 (list[dict], error)。每条为活动路由，persist 标记是否为永久路由。"""
+    code, out = run_ps(GET_ROUTES_PS, timeout=30)
+    if code != 0:
+        return [], out
+    try:
+        data = json.loads(out)
+    except Exception as e:
+        return [], f"解析路由数据失败：{e}"
+    if isinstance(data, dict):
+        data = [data]
+    routes = []
+    for r in data:
+        mask = r.get("mask", "")
+        prefix = r.get("prefix", 0)
+        if not mask and prefix:
+            mask = prefix_to_mask(prefix)
+        routes.append({
+            "dest": r.get("dest", ""),
+            "prefix": prefix,
+            "mask": mask,
+            "gw": r.get("gw", ""),
+            "iface": r.get("iface", ""),
+            "ifIndex": r.get("ifIndex", 0),
+            "metric": r.get("metric", 0),
+            "persist": bool(r.get("persist", False)),
+        })
+    return routes, ""
+
+
+def add_route(dest, mask, gw, metric, if_index, persist, log):
+    """添加静态路由。返回 (ok, msg)。"""
+    args = ["add", dest, "mask", mask, gw]
+    if metric:
+        args += ["metric", str(metric)]
+    if if_index:
+        args += ["if", str(if_index)]
+    if persist:
+        args = ["-p"] + args
+    code, out = run_route(args)
+    if code != 0:
+        kind = "永久" if persist else "临时"
+        return False, f"添加{kind}路由失败：{out}"
+    kind = "永久" if persist else "临时"
+    log(f"已添加{kind}路由：{dest} / {mask} → {gw}"
+        + (f"（metric {metric}）" if metric else ""))
+    return True, ""
+
+
+def delete_route(route, log):
+    """删除路由（永久路由会同时删除持久条目）。返回 (ok, msg)。"""
+    dest = route.get("dest", "")
+    gw = route.get("gw", "")
+    args = ["delete", dest]
+    if gw and gw != "0.0.0.0":
+        args.append(gw)
+    code, out = run_route(args)
+    if code != 0:
+        return False, f"删除路由失败：{out}"
+    kind = "永久" if route.get("persist") else "临时"
+    log(f"已删除{kind}路由：{dest} → {gw or '任意网关'}")
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # 写入配置（netsh，安全）
 # ---------------------------------------------------------------------------
 def apply_dhcp(adapter_name, log):
@@ -414,12 +647,12 @@ class ProfileEditDialog(tk.Toplevel):
         # 附加 IP
         frm_extra = ttk.LabelFrame(frm, text=" 附加 IP（可选） ")
         frm_extra.pack(fill="x", pady=6)
-        rx = ttk.Frame(frm_extra)
+        rx = ttk.Frame(frm_extra, style="Card.TFrame")
         rx.pack(fill="x", padx=6, pady=4)
-        ttk.Label(rx, text="IP：").pack(side="left")
+        ttk.Label(rx, text="IP：", style="Card.TLabel").pack(side="left")
         self.extra_ip_entry = ttk.Entry(rx, width=13)
         self.extra_ip_entry.pack(side="left", padx=4)
-        ttk.Label(rx, text="掩码：").pack(side="left")
+        ttk.Label(rx, text="掩码：", style="Card.TLabel").pack(side="left")
         self.extra_mask_combo = ttk.Combobox(rx, values=COMMON_MASKS, width=13)
         self.extra_mask_combo.pack(side="left", padx=4)
         self.extra_mask_combo.set("255.255.255.0")
@@ -444,7 +677,8 @@ class ProfileEditDialog(tk.Toplevel):
         # 确定 / 取消
         rb = ttk.Frame(frm)
         rb.pack(fill="x", pady=(8, 0))
-        ttk.Button(rb, text="确定", width=10, command=self._ok).pack(side="right", padx=6)
+        ttk.Button(rb, text="确定", style="Accent.TButton", width=10,
+                   command=self._ok).pack(side="right", padx=6)
         ttk.Button(rb, text="取消", width=10, command=self.destroy).pack(side="right")
 
         self.static_widgets = [
@@ -464,14 +698,16 @@ class ProfileEditDialog(tk.Toplevel):
         self.geometry("+%d+%d" % (mx + (mw - w) // 2, my + (mh - h) // 2))
 
     def _add_field(self, parent, row, label, value):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=4, pady=2)
+        ttk.Label(parent, text=label, style="Card.TLabel").grid(
+            row=row, column=0, sticky="e", padx=4, pady=2)
         e = ttk.Entry(parent, width=18)
         e.grid(row=row, column=1, sticky="w", padx=4, pady=2)
         e.insert(0, value)
         return e
 
     def _add_combo(self, parent, row, label, value):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=4, pady=2)
+        ttk.Label(parent, text=label, style="Card.TLabel").grid(
+            row=row, column=0, sticky="e", padx=4, pady=2)
         c = ttk.Combobox(parent, values=COMMON_MASKS, width=16)
         c.grid(row=row, column=1, sticky="w", padx=4, pady=2)
         c.set(value)
@@ -585,24 +821,142 @@ class IpChangerApp(tk.Tk):
         # 自适应屏幕：窗口不超过屏幕的 90%，并居中
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        w = min(820, sw - 40)
-        h = min(780, sh - 60)
+        w = min(860, sw - 40)
+        h = min(880, sh - 60)
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 2 - 10)
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(660, 540)
 
+        self.configure(bg=BG)
         try:
             style = ttk.Style(self)
-            style.theme_use("vista")
-            style.configure("TLabel", font=("Microsoft YaHei UI", 9))
-            style.configure("TButton", font=("Microsoft YaHei UI", 9))
-            style.configure("TRadiobutton", font=("Microsoft YaHei UI", 9))
-            style.configure("TCombobox", font=("Microsoft YaHei UI", 9))
-            style.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=22)
-            style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+            style.theme_use("clam")
+
+            # 全局
+            style.configure(".", background=BG, foreground=TEXT,
+                            font=("Microsoft YaHei UI", 9))
+            style.configure("TFrame", background=BG)
+            style.configure("TLabel", background=BG, foreground=TEXT)
+            style.configure("Muted.TLabel", background=BG, foreground=MUTED)
+
+            # 卡片式 LabelFrame（白色）
+            style.configure("TLabelframe", background=CARD, bordercolor=BORDER,
+                            relief="solid", borderwidth=1)
+            style.configure("TLabelframe.Label", background=CARD,
+                            foreground=PRIMARY,
+                            font=("Microsoft YaHei UI", 9, "bold"))
+            # 卡片内部控件（白色背景）
+            style.configure("Card.TFrame", background=CARD)
+            style.configure("Card.TLabel", background=CARD, foreground=TEXT)
+            style.configure("Card.Muted.TLabel", background=CARD, foreground=MUTED)
+            style.configure("Card.TRadiobutton", background=CARD, foreground=TEXT)
+            style.configure("Card.TCheckbutton", background=CARD, foreground=TEXT)
+
+            # 普通按钮
+            style.configure("TButton", background="#e2e8f0", foreground=TEXT,
+                            bordercolor="#cbd5e1", focusthickness=0,
+                            font=("Microsoft YaHei UI", 9), padding=3)
+            style.map("TButton",
+                      background=[("active", "#cbd5e1"),
+                                  ("disabled", "#f1f5f9")],
+                      foreground=[("disabled", "#94a3b8")])
+            # 主按钮（蓝色）
+            style.configure("Accent.TButton", background=PRIMARY,
+                            foreground="white", bordercolor=PRIMARY,
+                            font=("Microsoft YaHei UI", 9, "bold"), padding=4)
+            style.map("Accent.TButton",
+                      background=[("active", PRIMARY_DARK),
+                                  ("disabled", "#93c5fd")],
+                      foreground=[("disabled", "#eff6ff")])
+
+            # 单选/复选（窗口背景）
+            style.configure("TRadiobutton", background=BG, foreground=TEXT)
+            style.configure("TCheckbutton", background=BG, foreground=TEXT)
+
+            # Notebook：未选中又小又暗，选中又大又亮
+            style.configure("TNotebook", background=BG, borderwidth=0,
+                            tabmargins=(8, 6, 8, 0))
+            style.configure("TNotebook.Tab", background="#d4dce9",
+                            foreground=MUTED, padding=(12, 4),
+                            font=("Microsoft YaHei UI", 9))
+            style.map("TNotebook.Tab",
+                      background=[("selected", PRIMARY), ("active", "#e7ecf4")],
+                      foreground=[("selected", "#ffffff"), ("active", TEXT)],
+                      padding=[("selected", (26, 9))],
+                      font=[("selected", ("Microsoft YaHei UI", 11, "bold"))])
+
+            # 输入框
+            style.configure("TEntry", fieldbackground="white",
+                            bordercolor=BORDER, lightcolor=BORDER,
+                            darkcolor=BORDER, insertcolor=TEXT)
+            style.configure("TCombobox", fieldbackground="white",
+                            background="white", arrowcolor=PRIMARY,
+                            bordercolor=BORDER, lightcolor=BORDER,
+                            darkcolor=BORDER, insertcolor=TEXT)
+
+            # Treeview
+            style.configure("Treeview", background="white", fieldbackground="white",
+                            foreground=TEXT, rowheight=24, bordercolor=BORDER,
+                            borderwidth=1)
+            style.configure("Treeview.Heading", background=HEADER_BG,
+                            foreground="#334155",
+                            font=("Microsoft YaHei UI", 9, "bold"),
+                            borderwidth=1, relief="flat")
+            style.map("Treeview",
+                      background=[("selected", "#dbeafe")],
+                      foreground=[("selected", "#1e40af")])
+            style.map("Treeview.Heading", background=[("active", "#e2e8f0")])
+
+            # 复选框：自定义指示器（选中显示对勾，而非 clam 默认的 ×）
+            self._build_check_indicator(style)
         except Exception:
             pass
+
+    def _build_check_indicator(self, style):
+        s = 16
+
+        def make(fill, border, check=None):
+            img = tk.PhotoImage(width=s, height=s)
+            img.put(fill, to=(0, 0, s - 1, s - 1))
+            for i in range(s):
+                img.put(border, (i, 0)); img.put(border, (i, s - 1))
+                img.put(border, (0, i)); img.put(border, (s - 1, i))
+            if check:
+                def line(x0, y0, x1, y1):
+                    dx, dy = x1 - x0, y1 - y0
+                    steps = max(abs(dx), abs(dy))
+                    for i in range(steps + 1):
+                        x = round(x0 + dx * i / steps)
+                        y = round(y0 + dy * i / steps)
+                        for ox in (-1, 0):
+                            for oy in (-1, 0):
+                                xx, yy = x + ox, y + oy
+                                if 0 <= xx < s and 0 <= yy < s:
+                                    img.put(check, (xx, yy))
+                line(3, 8, 6, 12)
+                line(6, 12, 12, 4)
+            return img
+
+        img_off = make("#ffffff", BORDER)
+        img_on = make(PRIMARY, PRIMARY_DARK, check="#ffffff")
+        img_off_dis = make("#f1f5f9", "#cbd5e1")
+        img_on_dis = make("#93c5fd", "#93c5fd", check="#eff6ff")
+        # 保持引用，防止被垃圾回收
+        self._check_imgs = [img_off, img_on, img_off_dis, img_on_dis]
+
+        style.element_create(
+            "Custom.checkindicator", "image", img_off,
+            (("selected",), img_on),
+            (("disabled",), img_off_dis),
+            (("selected", "disabled"), img_on_dis),
+        )
+        style.layout("TCheckbutton", [
+            ("Checkbutton.padding", {"sticky": "nswe", "children": [
+                ("Custom.checkindicator", {"side": "left", "sticky": ""}),
+                ("Checkbutton.focus", {"side": "left", "sticky": "w",
+                                       "children": [
+                    ("Checkbutton.label", {"sticky": "nswe"})]})]})])
 
         self.adapters = []
         self.profiles = load_profiles()
@@ -618,10 +972,16 @@ class IpChangerApp(tk.Tk):
 
         self.refresh_adapters()
         self.refresh_profiles()
+        self.refresh_routes()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         pad = {"padx": 6, "pady": 3}
+
+        # 顶部渐变横幅
+        self.banner = tk.Canvas(self, height=76, highlightthickness=0, bd=0)
+        self.banner.pack(fill="x")
+        self.banner.bind("<Configure>", self._draw_banner)
 
         self.warn_var = tk.StringVar(value="")
         self.warn_label = tk.Label(
@@ -629,13 +989,21 @@ class IpChangerApp(tk.Tk):
             font=("Microsoft YaHei UI", 9, "bold"), wraplength=760,
         )
 
+        # 主体：标签页（IP 切换 / 路由管理）
+        self.nb = ttk.Notebook(self)
+        self.tab_ip = ttk.Frame(self.nb)
+        self.tab_route = ttk.Frame(self.nb)
+        self.nb.add(self.tab_ip, text="  IP 切换  ")
+        self.nb.add(self.tab_route, text="  路由管理  ")
+        self.nb.pack(fill="both", expand=True, padx=6, pady=4)
+
         # 1. 网卡选择
-        frm_a = ttk.LabelFrame(self, text=" 网卡选择 ")
+        frm_a = ttk.LabelFrame(self.tab_ip, text=" 网卡选择 ")
         frm_a.pack(fill="x", **pad)
 
-        r1 = ttk.Frame(frm_a)
+        r1 = ttk.Frame(frm_a, style="Card.TFrame")
         r1.pack(fill="x", padx=6, pady=5)
-        ttk.Label(r1, text="网卡：").pack(side="left")
+        ttk.Label(r1, text="网卡：", style="Card.TLabel").pack(side="left")
         self.adapter_combo = ttk.Combobox(r1, state="readonly")
         self.adapter_combo.pack(side="left", fill="x", expand=True, padx=6)
         self.adapter_combo.bind("<<ComboboxSelected>>", lambda e: self._on_adapter_selected())
@@ -643,46 +1011,85 @@ class IpChangerApp(tk.Tk):
         self.btn_refresh.pack(side="left")
 
         self.info_var = tk.StringVar(value="正在读取网卡……")
-        ttk.Label(frm_a, textvariable=self.info_var, foreground="#2c3e50", justify="left")\
+        ttk.Label(frm_a, textvariable=self.info_var, style="Card.TLabel",
+                  foreground="#2c3e50", justify="left")\
             .pack(anchor="w", padx=8, pady=(0, 5))
 
-        # 2. IP 设置
-        frm_ip = ttk.LabelFrame(self, text=" IP 设置 ")
-        frm_ip.pack(fill="x", **pad)
+        # 2. 可滚动区域（网卡选择固定；IP 设置 / 配置档案均可上下滚动翻看）
+        scroll_holder = ttk.Frame(self.tab_ip)
+        scroll_holder.pack(fill="both", expand=True, padx=6, pady=(0, 3))
+        self.ip_canvas = tk.Canvas(scroll_holder, highlightthickness=0,
+                                   bd=0, bg=BG)
+        ip_vsb = ttk.Scrollbar(scroll_holder, orient="vertical",
+                               command=self.ip_canvas.yview)
+        self.ip_canvas.configure(yscrollcommand=ip_vsb.set)
+        ip_vsb.pack(side="right", fill="y")
+        self.ip_canvas.pack(side="left", fill="both", expand=True)
+
+        self.scroll_inner = ttk.Frame(self.ip_canvas)
+        self._ip_win = self.ip_canvas.create_window(
+            (0, 0), window=self.scroll_inner, anchor="nw")
+        self.scroll_inner.bind(
+            "<Configure>",
+            lambda e: self.ip_canvas.configure(
+                scrollregion=self.ip_canvas.bbox("all")))
+        self.ip_canvas.bind("<Configure>", self._on_ip_canvas_config)
+        self.ip_canvas.bind("<Enter>",
+                            lambda e: self.ip_canvas.bind_all(
+                                "<MouseWheel>", self._on_ip_wheel))
+        self.ip_canvas.bind("<Leave>",
+                            lambda e: self.ip_canvas.unbind_all("<MouseWheel>"))
+
+        # ---- IP 设置（横向分布，少占纵向空间）----
+        frm_ip = ttk.LabelFrame(self.scroll_inner, text=" IP 设置 ")
+        frm_ip.pack(fill="x", padx=2, pady=3)
 
         self.mode_var = tk.StringVar(value="dhcp")
-        r2 = ttk.Frame(frm_ip)
+        r2 = ttk.Frame(frm_ip, style="Card.TFrame")
         r2.pack(fill="x", padx=8, pady=(5, 2))
         ttk.Radiobutton(r2, text="自动获取 IP（DHCP）", variable=self.mode_var,
-                        value="dhcp", command=self._toggle_mode).pack(side="left")
+                        value="dhcp", command=self._toggle_mode,
+                        style="Card.TRadiobutton").pack(side="left")
         ttk.Radiobutton(r2, text="使用下面的静态 IP", variable=self.mode_var,
-                        value="static", command=self._toggle_mode).pack(side="left", padx=18)
+                        value="static", command=self._toggle_mode,
+                        style="Card.TRadiobutton").pack(side="left", padx=18)
 
-        # 主 IP 表单
-        self.frm_static = ttk.Frame(frm_ip)
-        self.frm_static.pack(fill="x", padx=20, pady=4)
+        # 静态参数：横向两行
+        self.frm_static = ttk.Frame(frm_ip, style="Card.TFrame")
+        self.frm_static.pack(fill="x", padx=12, pady=3)
 
-        self.ip_entry = self._add_field(self.frm_static, 0, "主 IP：", width=16)
-        self.mask_combo = ttk.Combobox(self.frm_static, values=COMMON_MASKS, width=14,
-                                       font=("Microsoft YaHei UI", 9))
-        self.mask_combo.grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Label(self.frm_static, text="子网掩码：").grid(row=1, column=0, sticky="e", pady=2)
-        self.gw_entry = self._add_field(self.frm_static, 2, "默认网关：", width=16)
-        self.dns1_entry = self._add_field(self.frm_static, 3, "首选 DNS：", width=16)
-        self.dns2_entry = self._add_field(self.frm_static, 4, "备用 DNS：", width=16)
+        rowA = ttk.Frame(self.frm_static, style="Card.TFrame")
+        rowA.pack(fill="x", pady=2)
+        ttk.Label(rowA, text="主 IP：", style="Card.TLabel").pack(side="left")
+        self.ip_entry = ttk.Entry(rowA, width=14, font=("Consolas", 9))
+        self.ip_entry.pack(side="left", padx=(2, 12))
+        ttk.Label(rowA, text="掩码：", style="Card.TLabel").pack(side="left")
+        self.mask_combo = ttk.Combobox(rowA, values=COMMON_MASKS, width=13)
+        self.mask_combo.pack(side="left", padx=(2, 12))
+        ttk.Label(rowA, text="网关：", style="Card.TLabel").pack(side="left")
+        self.gw_entry = ttk.Entry(rowA, width=14, font=("Consolas", 9))
+        self.gw_entry.pack(side="left", padx=(2, 0))
+
+        rowB = ttk.Frame(self.frm_static, style="Card.TFrame")
+        rowB.pack(fill="x", pady=2)
+        ttk.Label(rowB, text="首选 DNS：", style="Card.TLabel").pack(side="left")
+        self.dns1_entry = ttk.Entry(rowB, width=14, font=("Consolas", 9))
+        self.dns1_entry.pack(side="left", padx=(2, 12))
+        ttk.Label(rowB, text="备用 DNS：", style="Card.TLabel").pack(side="left")
+        self.dns2_entry = ttk.Entry(rowB, width=14, font=("Consolas", 9))
+        self.dns2_entry.pack(side="left", padx=(2, 0))
 
         # 附加 IP
         frm_extra = ttk.LabelFrame(frm_ip, text=" 附加 IP（同一网卡绑定多个 IP，可选） ")
         frm_extra.pack(fill="x", padx=12, pady=(3, 4))
 
-        r_extra = ttk.Frame(frm_extra)
+        r_extra = ttk.Frame(frm_extra, style="Card.TFrame")
         r_extra.pack(fill="x", padx=6, pady=4)
-        ttk.Label(r_extra, text="IP：").pack(side="left")
+        ttk.Label(r_extra, text="IP：", style="Card.TLabel").pack(side="left")
         self.extra_ip_entry = ttk.Entry(r_extra, width=14, font=("Consolas", 9))
         self.extra_ip_entry.pack(side="left", padx=(2, 6))
-        ttk.Label(r_extra, text="掩码：").pack(side="left")
-        self.extra_mask_combo = ttk.Combobox(r_extra, values=COMMON_MASKS, width=13,
-                                             font=("Microsoft YaHei UI", 9))
+        ttk.Label(r_extra, text="掩码：", style="Card.TLabel").pack(side="left")
+        self.extra_mask_combo = ttk.Combobox(r_extra, values=COMMON_MASKS, width=13)
         self.extra_mask_combo.pack(side="left", padx=2)
         self.extra_mask_combo.set("255.255.255.0")
         self.btn_extra_add = ttk.Button(r_extra, text="添加", width=5, command=self._add_extra)
@@ -690,17 +1097,24 @@ class IpChangerApp(tk.Tk):
         self.btn_extra_del = ttk.Button(r_extra, text="删除选中", width=8, command=self._del_extra)
         self.btn_extra_del.pack(side="left")
 
-        self.extra_tree = ttk.Treeview(frm_extra, columns=("ip", "mask"),
+        extra_wrap = ttk.Frame(frm_extra, style="Card.TFrame")
+        extra_wrap.pack(fill="x", padx=6, pady=(0, 4))
+        self.extra_tree = ttk.Treeview(extra_wrap, columns=("ip", "mask"),
                                        show="headings", selectmode="browse", height=3)
         self.extra_tree.heading("ip", text="附加 IP 地址")
         self.extra_tree.heading("mask", text="子网掩码")
-        self.extra_tree.column("ip", width=300, anchor="center")
-        self.extra_tree.column("mask", width=300, anchor="center")
-        self.extra_tree.pack(fill="x", padx=6, pady=(0, 4))
+        self.extra_tree.column("ip", width=280, anchor="center")
+        self.extra_tree.column("mask", width=240, anchor="center")
+        extra_vsb = ttk.Scrollbar(extra_wrap, orient="vertical",
+                                  command=self.extra_tree.yview)
+        self.extra_tree.configure(yscrollcommand=extra_vsb.set)
+        extra_vsb.pack(side="right", fill="y")
+        self.extra_tree.pack(side="left", fill="both", expand=True)
 
-        r3 = ttk.Frame(frm_ip)
+        r3 = ttk.Frame(frm_ip, style="Card.TFrame")
         r3.pack(fill="x", padx=8, pady=(1, 6))
-        self.btn_apply = ttk.Button(r3, text="应用配置", width=11, command=self._on_apply)
+        self.btn_apply = ttk.Button(r3, text="应用配置", style="Accent.TButton",
+                                   width=11, command=self._on_apply)
         self.btn_apply.pack(side="left")
 
         self.static_controls = [
@@ -711,25 +1125,30 @@ class IpChangerApp(tk.Tk):
         ]
 
         # 3. 档案
-        frm_p = ttk.LabelFrame(self, text=" 配置档案（不绑定网卡；右键档案可编辑/应用/删除） ")
-        frm_p.pack(fill="both", expand=True, **pad)
+        frm_p = ttk.LabelFrame(self.scroll_inner,
+                               text=" 配置档案（不绑定网卡；右键档案可编辑/应用/删除） ")
+        frm_p.pack(fill="x", padx=2, pady=3)
 
-        r4 = ttk.Frame(frm_p)
+        r4 = ttk.Frame(frm_p, style="Card.TFrame")
         r4.pack(fill="x", padx=6, pady=5)
-        ttk.Label(r4, text="档案名称：").pack(side="left")
+        ttk.Label(r4, text="档案名称：", style="Card.TLabel").pack(side="left")
         self.prof_name_entry = ttk.Entry(r4, width=14)
         self.prof_name_entry.pack(side="left", padx=6)
         self.btn_save = ttk.Button(r4, text="保存/覆盖", width=9, command=self._on_save)
         self.btn_save.pack(side="left", padx=3)
-        self.btn_apply_p = ttk.Button(r4, text="一键应用", width=9, command=self._on_apply_profile)
+        self.btn_apply_p = ttk.Button(r4, text="一键应用", style="Accent.TButton",
+                                      width=9, command=self._on_apply_profile)
         self.btn_apply_p.pack(side="left", padx=3)
         self.btn_del = ttk.Button(r4, text="删除", width=7, command=self._on_delete)
         self.btn_del.pack(side="left", padx=3)
-        ttk.Label(r4, text="（提示：在档案上点鼠标右键）", foreground="#7f8c8d")\
+        ttk.Label(r4, text="（提示：在档案上点鼠标右键）", style="Card.Muted.TLabel")\
             .pack(side="left", padx=8)
 
         cols = ("name", "mode", "ip", "gw", "time")
-        self.tree = ttk.Treeview(frm_p, columns=cols, show="headings", selectmode="browse")
+        tree_wrap = ttk.Frame(frm_p, style="Card.TFrame")
+        tree_wrap.pack(fill="x", padx=6, pady=(0, 4))
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
+                                 selectmode="browse", height=8)
         self.tree.heading("name", text="档案名称")
         self.tree.heading("mode", text="模式")
         self.tree.heading("ip", text="IP（主 IP + 附加数量）")
@@ -739,8 +1158,13 @@ class IpChangerApp(tk.Tk):
         self.tree.column("mode", width=60, anchor="center")
         self.tree.column("ip", width=280, anchor="w")
         self.tree.column("gw", width=120, anchor="w")
-        self.tree.column("time", width=120, anchor="center")
-        self.tree.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+        self.tree.column("time", width=130, anchor="center")
+        # 右侧垂直滚动条
+        prof_vsb = ttk.Scrollbar(tree_wrap, orient="vertical",
+                                 command=self.tree.yview)
+        self.tree.configure(yscrollcommand=prof_vsb.set)
+        prof_vsb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="x")
         self.tree.bind("<Double-1>", lambda e: self._on_apply_profile())
 
         # 右键菜单
@@ -755,7 +1179,7 @@ class IpChangerApp(tk.Tk):
         frm_log = ttk.LabelFrame(self, text=" 操作日志 ")
         frm_log.pack(fill="x", **pad)
         self.log_text = tk.Text(
-            frm_log, height=6, font=("Consolas", 9),
+            frm_log, height=5, font=("Consolas", 9),
             bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="disabled",
         )
         self.log_text.pack(fill="x", padx=6, pady=4)
@@ -764,11 +1188,313 @@ class IpChangerApp(tk.Tk):
             self.btn_apply, self.btn_save, self.btn_apply_p, self.btn_del,
         ]
 
-    def _add_field(self, parent, row, label, width):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", pady=2)
-        e = ttk.Entry(parent, width=width, font=("Consolas", 9))
-        e.grid(row=row, column=1, sticky="w", pady=2)
-        return e
+        # 路由管理标签页
+        self._build_route_tab()
+
+    # ------------------------------------------------- 可滚动区域
+    def _on_ip_canvas_config(self, event):
+        # 让内部框架宽度跟随画布，保证横向填满
+        self.ip_canvas.itemconfigure(self._ip_win, width=event.width)
+
+    def _on_ip_wheel(self, event):
+        self.ip_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    # ------------------------------------------------------- 渐变横幅
+    def _draw_banner(self, event=None):
+        c = self.banner
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1:
+            return
+
+        # 横向渐变：深蓝 → 主蓝 → 青
+        stops = [(0x1e, 0x3a, 0x8a), (0x25, 0x63, 0xeb), (0x06, 0xb6, 0xd4)]
+        for x in range(w):
+            t = x / max(1, w - 1)
+            if t < 0.5:
+                k = t / 0.5
+                a, b = stops[0], stops[1]
+            else:
+                k = (t - 0.5) / 0.5
+                a, b = stops[1], stops[2]
+            r = int(a[0] + (b[0] - a[0]) * k)
+            g = int(a[1] + (b[1] - a[1]) * k)
+            bl = int(a[2] + (b[2] - a[2]) * k)
+            c.create_line(x, 0, x, h, fill="#%02x%02x%02x" % (r, g, bl))
+
+        # 装饰：右侧网络节点 + 连线（科技感）
+        import random
+        random.seed(42)
+        nodes = []
+        for i in range(9):
+            nx = w * 0.55 + random.random() * w * 0.42
+            ny = 12 + random.random() * (h - 24)
+            nodes.append((nx, ny))
+        # 连线（每个节点连最近的 1-2 个）
+        for i, (x1, y1) in enumerate(nodes):
+            dists = sorted(
+                (( (x2 - x1) ** 2 + (y2 - y1) ** 2, j)
+                 for j, (x2, y2) in enumerate(nodes) if j != i))
+            for d, j in dists[:2]:
+                if d < (w * 0.16) ** 2:
+                    c.create_line(x1, y1, nodes[j][0], nodes[j][1],
+                                  fill="#ffffff", stipple="gray50", width=1)
+        for (nx, ny) in nodes:
+            c.create_oval(nx - 4, ny - 4, nx + 4, ny + 4,
+                          fill="#ffffff", outline="")
+            c.create_oval(nx - 8, ny - 8, nx + 8, ny + 8,
+                          fill="", outline="#ffffff", stipple="gray75")
+
+        # 标题文字
+        c.create_text(22, h / 2 - 12, text="NetSwitch", anchor="w",
+                      fill="#ffffff", font=("Segoe UI", 17, "bold"))
+        c.create_text(24, h / 2 + 14, text="IP 快切 · 静态路由管理", anchor="w",
+                      fill="#dbeafe", font=("Microsoft YaHei UI", 9))
+
+    # ------------------------------------------------------- 路由标签页 UI
+    def _build_route_tab(self):
+        tab = self.tab_route
+
+        # 顶部：筛选 + 刷新
+        top = ttk.Frame(tab)
+        top.pack(fill="x", padx=6, pady=(6, 3))
+        ttk.Label(top, text="网卡筛选：").pack(side="left")
+        self.route_filter_combo = ttk.Combobox(top, state="readonly", width=30)
+        self.route_filter_combo.pack(side="left", padx=6)
+        self.route_filter_combo.bind("<<ComboboxSelected>>",
+                                     lambda e: self._refresh_route_tree())
+        self.route_static_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="仅显示静态路由（网关非 0.0.0.0）",
+                        variable=self.route_static_only,
+                        command=self._refresh_route_tree).pack(side="left", padx=8)
+        self.btn_route_refresh = ttk.Button(top, text="刷新", width=7,
+                                            command=self.refresh_routes)
+        self.btn_route_refresh.pack(side="right")
+
+        # 路由列表
+        cols = ("dest", "mask", "gw", "iface", "metric", "kind")
+        frm_list = ttk.LabelFrame(tab, text=" 路由表（永久 / 临时） ")
+        frm_list.pack(fill="both", expand=True, padx=6, pady=3)
+        self.route_tree = ttk.Treeview(frm_list, columns=cols, show="headings",
+                                       selectmode="browse")
+        self.route_tree.heading("dest", text="目标网络")
+        self.route_tree.heading("mask", text="子网掩码")
+        self.route_tree.heading("gw", text="网关（下一跳）")
+        self.route_tree.heading("iface", text="网卡")
+        self.route_tree.heading("metric", text="度量值")
+        self.route_tree.heading("kind", text="类型")
+        self.route_tree.column("dest", width=150, anchor="center")
+        self.route_tree.column("mask", width=140, anchor="center")
+        self.route_tree.column("gw", width=150, anchor="center")
+        self.route_tree.column("iface", width=150, anchor="w")
+        self.route_tree.column("metric", width=70, anchor="center")
+        self.route_tree.column("kind", width=80, anchor="center")
+        vsb = ttk.Scrollbar(frm_list, orient="vertical",
+                            command=self.route_tree.yview)
+        self.route_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.route_tree.pack(fill="both", expand=True, padx=(6, 0), pady=4)
+
+        # 添加路由表单
+        frm_add = ttk.LabelFrame(tab, text=" 添加静态路由 ")
+        frm_add.pack(fill="x", padx=6, pady=(3, 4))
+
+        g1 = ttk.Frame(frm_add, style="Card.TFrame")
+        g1.pack(fill="x", padx=8, pady=4)
+        ttk.Label(g1, text="目标网络：", style="Card.TLabel").pack(side="left")
+        self.rt_dest_entry = ttk.Entry(g1, width=15, font=("Consolas", 9))
+        self.rt_dest_entry.pack(side="left", padx=(2, 10))
+        ttk.Label(g1, text="子网掩码：", style="Card.TLabel").pack(side="left")
+        self.rt_mask_combo = ttk.Combobox(g1, values=ROUTE_MASKS, width=14,
+                                          font=("Microsoft YaHei UI", 9))
+        self.rt_mask_combo.pack(side="left", padx=(2, 10))
+        self.rt_mask_combo.set("255.255.255.0")
+        ttk.Label(g1, text="网关：", style="Card.TLabel").pack(side="left")
+        self.rt_gw_entry = ttk.Entry(g1, width=15, font=("Consolas", 9))
+        self.rt_gw_entry.pack(side="left", padx=(2, 10))
+
+        g2 = ttk.Frame(frm_add, style="Card.TFrame")
+        g2.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(g2, text="度量值：", style="Card.TLabel").pack(side="left")
+        self.rt_metric_entry = ttk.Entry(g2, width=6, font=("Consolas", 9))
+        self.rt_metric_entry.pack(side="left", padx=(2, 10))
+        ttk.Label(g2, text="出接口网卡：", style="Card.TLabel").pack(side="left")
+        self.rt_if_combo = ttk.Combobox(g2, state="readonly", width=30)
+        self.rt_if_combo.pack(side="left", padx=(2, 10))
+        self.rt_persist = tk.BooleanVar(value=True)
+        ttk.Checkbutton(g2, text="永久路由（重启保留）",
+                        variable=self.rt_persist,
+                        style="Card.TCheckbutton").pack(side="left", padx=8)
+        self.btn_route_add = ttk.Button(g2, text="添加路由", style="Accent.TButton",
+                                        width=10, command=self._on_add_route)
+        self.btn_route_add.pack(side="right")
+        self.btn_route_del = ttk.Button(g2, text="删除选中路由", width=12,
+                                        command=self._on_del_route)
+        self.btn_route_del.pack(side="right", padx=6)
+
+        self.routes = []
+        self.route_buttons = [
+            self.btn_route_refresh, self.btn_route_add, self.btn_route_del,
+        ]
+
+    # ------------------------------------------------------- 路由读取/显示
+    def refresh_routes(self):
+        if self._busy:
+            return
+        self.btn_route_refresh.configure(state="disabled")
+
+        def task():
+            try:
+                routes, err = get_routes()
+                self.after(0, self._update_routes, routes, err)
+            except Exception as e:
+                self.after(0, self._update_routes, [], f"读取路由出错：{e}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _update_routes(self, routes, err):
+        self.routes = routes
+        if err:
+            self.log("读取路由失败：" + err[:300])
+        # 网卡筛选下拉
+        names = sorted({r["iface"] for r in routes if r["iface"]})
+        filter_values = ["全部网卡"] + names
+        self.route_filter_combo["values"] = filter_values
+        if self.route_filter_combo.current() < 0:
+            self.route_filter_combo.current(0)
+        self._refresh_route_tree()
+        self.btn_route_refresh.configure(state="normal")
+
+    def _refresh_route_tree(self):
+        for i in self.route_tree.get_children():
+            self.route_tree.delete(i)
+
+        fidx = self.route_filter_combo.current()
+        if fidx < 0:
+            fidx = 0
+        values = self.route_filter_combo["values"]
+        filter_iface = values[fidx] if fidx < len(values) else "全部网卡"
+        static_only = self.route_static_only.get()
+
+        for r in self.routes:
+            if filter_iface != "全部网卡" and r["iface"] != filter_iface:
+                continue
+            if static_only and (not r["gw"] or r["gw"] == "0.0.0.0"):
+                continue
+            kind = "永久" if r["persist"] else "临时"
+            self.route_tree.insert(
+                "", "end",
+                values=(r["dest"], r["mask"], r["gw"], r["iface"],
+                        r["metric"], kind),
+            )
+
+    def _selected_route(self):
+        item = self.route_tree.focus()
+        if not item:
+            return None
+        vals = self.route_tree.item(item, "values")
+        dest, mask, gw = vals[0], vals[1], vals[2]
+        for r in self.routes:
+            if (r["dest"] == dest and r["mask"] == mask
+                    and r["gw"] == gw):
+                return r
+        return None
+
+    # ------------------------------------------------------- 路由增删
+    def _on_add_route(self):
+        if self._busy:
+            return
+        if not is_admin():
+            messagebox.showerror("权限不足", "需要管理员权限，请使用「启动工具.bat」运行。")
+            return
+        dest = self.rt_dest_entry.get().strip()
+        mask = self.rt_mask_combo.get().strip()
+        gw = self.rt_gw_entry.get().strip()
+        metric = self.rt_metric_entry.get().strip()
+        persist = self.rt_persist.get()
+
+        if not valid_ipv4(dest):
+            messagebox.showerror("配置错误", "目标网络格式不正确（示例：10.0.0.0）。")
+            return
+        if mask_to_prefix(mask) is None:
+            messagebox.showerror("配置错误", "子网掩码不正确。")
+            return
+        if not valid_ipv4(gw):
+            messagebox.showerror("配置错误", "网关格式不正确（示例：192.168.1.1）。")
+            return
+        if metric:
+            if not metric.isdigit():
+                messagebox.showerror("配置错误", "度量值必须是数字；不需要可留空。")
+                return
+        if_index = None
+        if self.rt_if_combo.current() > 0:
+            a = self._route_if_adapter()
+            if a:
+                if_index = a.get("ifIndex")
+
+        kind = "永久" if persist else "临时"
+        if not messagebox.askyesno(
+            "确认",
+            f"将添加{kind}路由：\n{dest} / {mask} → {gw}"
+            + (f"\nmetric {metric}" if metric else "")
+            + (f"\n出接口：{self.rt_if_combo.get()}" if if_index else "")
+            + "\n是否继续？",
+        ):
+            return
+
+        self._run_route_op(
+            lambda: add_route(dest, mask, gw, metric, if_index,
+                              persist, self.log))
+
+    def _route_if_adapter(self):
+        idx = self.rt_if_combo.current()
+        values = self.rt_if_combo["values"]
+        if idx <= 0 or idx >= len(values):
+            return None
+        # 下拉文本为 "名称 — 描述 [状态]"，按名称匹配
+        text = values[idx]
+        for a in self.adapters:
+            if text.startswith(a["name"] + " "):
+                return a
+        return None
+
+    def _on_del_route(self):
+        if self._busy:
+            return
+        if not is_admin():
+            messagebox.showerror("权限不足", "需要管理员权限，请使用「启动工具.bat」运行。")
+            return
+        r = self._selected_route()
+        if not r:
+            messagebox.showwarning("提示", "请先在列表中选中要删除的路由。")
+            return
+        kind = "永久" if r["persist"] else "临时"
+        if not messagebox.askyesno(
+            "确认",
+            f"确定删除{kind}路由吗？\n{r['dest']} / {r['mask']} → {r['gw']}",
+        ):
+            return
+        self._run_route_op(lambda: delete_route(r, self.log))
+
+    def _run_route_op(self, op):
+        self.set_busy(True)
+
+        def task():
+            try:
+                ok, msg = op()
+                if not ok:
+                    self.log(msg)
+                    self.after(0, lambda: messagebox.showerror("失败", msg))
+                else:
+                    self.log("路由操作完成。")
+            except Exception as e:
+                self.log(f"发生错误：{e}")
+            finally:
+                self.set_busy(False)
+                self.after(800, self.refresh_routes)
+
+        threading.Thread(target=task, daemon=True).start()
 
     # ------------------------------------------------------------ 小工具
     def log(self, msg):
@@ -798,6 +1524,11 @@ class IpChangerApp(tk.Tk):
             b.configure(state=st)
         self.btn_refresh.configure(state=st)
         self.adapter_combo.configure(state="disabled" if busy else "readonly")
+        if hasattr(self, "route_buttons"):
+            for b in self.route_buttons:
+                b.configure(state=st)
+            self.route_filter_combo.configure(state="disabled" if busy else "readonly")
+            self.rt_if_combo.configure(state="disabled" if busy else "readonly")
 
     def selected_adapter(self):
         idx = self.adapter_combo.current()
@@ -903,9 +1634,15 @@ class IpChangerApp(tk.Tk):
             self.info_var.set("读取失败：" + err[:200])
             self.log("读取网卡失败：" + err[:300])
         else:
-            self.adapter_combo["values"] = [
+            adapter_labels = [
                 f'{a["name"]}  —  {a["desc"]}  [{a["status"]}]' for a in adapters
             ]
+            self.adapter_combo["values"] = adapter_labels
+            # 路由出接口下拉（"自动" + 各网卡）
+            if hasattr(self, "rt_if_combo"):
+                self.rt_if_combo["values"] = ["自动（不指定）"] + adapter_labels
+                if self.rt_if_combo.current() < 0:
+                    self.rt_if_combo.current(0)
             sel = 0
             if keep_desc:
                 for i, a in enumerate(adapters):
