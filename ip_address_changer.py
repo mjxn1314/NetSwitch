@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NetSwitch（IP 快切）Windows v1.4
+NetSwitch（IP 快切）Windows v1.5
 ================================
 功能：
   1. 快速枚举网卡（CIM，约 0.5 秒），显示 IP / 掩码 / 网关 / DNS / DHCP 状态
@@ -13,6 +13,7 @@ NetSwitch（IP 快切）Windows v1.4
   8. 【静态路由】查看系统/网卡的永久、临时路由，可添加、删除永久或临时路由
   9. 配置文件统一存放在「文档\\NetSwitch\\」，程序目录不再显示
  10. 窗口自适应屏幕大小，可自由缩放
+ 11. 专属图标（exe / 标题栏 / 横幅），IP 设置标签与输入框整齐对齐
 
 注意：
   - 修改 IP / 路由需要【管理员权限】，请使用同目录下的「启动工具.bat」运行
@@ -34,7 +35,9 @@ from tkinter import ttk, messagebox
 # ---------------------------------------------------------------------------
 # 路径
 # ---------------------------------------------------------------------------
-APP_TITLE = "NetSwitch - IP 快切 v1.4"
+APP_TITLE = "NetSwitch - IP 快切 v1.5"
+ICON_ICO = "NetSwitch.ico"
+ICON_PNG = "icon_256.png"
 
 # 现代浅色配色
 BG = "#eef2f8"          # 窗口背景（浅蓝灰）
@@ -51,6 +54,25 @@ if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(name):
+    """获取资源（图标等）路径：源码环境取程序目录，打包后取 PyInstaller 解包目录。"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", BASE_DIR)
+    else:
+        base = BASE_DIR
+    return os.path.join(base, name)
+
+
+def set_app_user_model_id():
+    """让任务栏正确显示独立图标（否则 windowed 打包后可能归到 python.exe）。"""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "gitee.NetSwitch.app.1.5")
+    except Exception:
+        pass
 
 
 def get_documents_dir():
@@ -612,6 +634,12 @@ class ProfileEditDialog(tk.Toplevel):
         super().__init__(master)
         self.title("编辑档案")
         self.resizable(False, False)
+        try:
+            ico = resource_path(ICON_ICO)
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
         self.result = None
         self.extra_ips = []
 
@@ -817,6 +845,8 @@ class IpChangerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
+        self.banner_icon = None
+        self._apply_icon()
 
         # 自适应屏幕：窗口不超过屏幕的 90%，并居中
         sw = self.winfo_screenwidth()
@@ -974,6 +1004,21 @@ class IpChangerApp(tk.Tk):
         self.refresh_profiles()
         self.refresh_routes()
 
+    def _apply_icon(self):
+        """设置标题栏图标，并预加载横幅图标。"""
+        try:
+            ico = resource_path(ICON_ICO)
+            if os.path.exists(ico):
+                self.iconbitmap(default=ico)
+        except Exception:
+            pass
+        try:
+            png = resource_path(ICON_PNG)
+            if os.path.exists(png):
+                self.banner_icon = tk.PhotoImage(file=png)
+        except Exception:
+            self.banner_icon = None
+
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         pad = {"padx": 6, "pady": 3}
@@ -1054,30 +1099,35 @@ class IpChangerApp(tk.Tk):
                         value="static", command=self._toggle_mode,
                         style="Card.TRadiobutton").pack(side="left", padx=18)
 
-        # 静态参数：横向两行
+        # 静态参数：统一 grid，标签右对齐、输入框等宽且上下对齐
         self.frm_static = ttk.Frame(frm_ip, style="Card.TFrame")
         self.frm_static.pack(fill="x", padx=12, pady=3)
+        g = self.frm_static
+        for _c in (0, 2, 4):
+            g.columnconfigure(_c, minsize=64)          # 标签列
+        for _c in (1, 3, 5):
+            g.columnconfigure(_c, weight=1)            # 输入列（等宽）
 
-        rowA = ttk.Frame(self.frm_static, style="Card.TFrame")
-        rowA.pack(fill="x", pady=2)
-        ttk.Label(rowA, text="主 IP：", style="Card.TLabel").pack(side="left")
-        self.ip_entry = ttk.Entry(rowA, width=14, font=("Consolas", 9))
-        self.ip_entry.pack(side="left", padx=(2, 12))
-        ttk.Label(rowA, text="掩码：", style="Card.TLabel").pack(side="left")
-        self.mask_combo = ttk.Combobox(rowA, values=COMMON_MASKS, width=13)
-        self.mask_combo.pack(side="left", padx=(2, 12))
-        ttk.Label(rowA, text="网关：", style="Card.TLabel").pack(side="left")
-        self.gw_entry = ttk.Entry(rowA, width=14, font=("Consolas", 9))
-        self.gw_entry.pack(side="left", padx=(2, 0))
+        def _glabel(r, c, text):
+            ttk.Label(g, text=text, style="Card.TLabel").grid(
+                row=r, column=c, sticky="e", padx=(0, 4), pady=3)
 
-        rowB = ttk.Frame(self.frm_static, style="Card.TFrame")
-        rowB.pack(fill="x", pady=2)
-        ttk.Label(rowB, text="首选 DNS：", style="Card.TLabel").pack(side="left")
-        self.dns1_entry = ttk.Entry(rowB, width=14, font=("Consolas", 9))
-        self.dns1_entry.pack(side="left", padx=(2, 12))
-        ttk.Label(rowB, text="备用 DNS：", style="Card.TLabel").pack(side="left")
-        self.dns2_entry = ttk.Entry(rowB, width=14, font=("Consolas", 9))
-        self.dns2_entry.pack(side="left", padx=(2, 0))
+        _glabel(0, 0, "主 IP：")
+        self.ip_entry = ttk.Entry(g, font=("Consolas", 9))
+        self.ip_entry.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=3)
+        _glabel(0, 2, "掩码：")
+        self.mask_combo = ttk.Combobox(g, values=COMMON_MASKS)
+        self.mask_combo.grid(row=0, column=3, sticky="ew", padx=(0, 14), pady=3)
+        _glabel(0, 4, "网关：")
+        self.gw_entry = ttk.Entry(g, font=("Consolas", 9))
+        self.gw_entry.grid(row=0, column=5, sticky="ew", pady=3)
+
+        _glabel(1, 0, "首选 DNS：")
+        self.dns1_entry = ttk.Entry(g, font=("Consolas", 9))
+        self.dns1_entry.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=3)
+        _glabel(1, 2, "备用 DNS：")
+        self.dns2_entry = ttk.Entry(g, font=("Consolas", 9))
+        self.dns2_entry.grid(row=1, column=3, sticky="ew", pady=3)
 
         # 附加 IP
         frm_extra = ttk.LabelFrame(frm_ip, text=" 附加 IP（同一网卡绑定多个 IP，可选） ")
@@ -1246,11 +1296,20 @@ class IpChangerApp(tk.Tk):
             c.create_oval(nx - 8, ny - 8, nx + 8, ny + 8,
                           fill="", outline="#ffffff", stipple="gray75")
 
-        # 标题文字
-        c.create_text(22, h / 2 - 12, text="NetSwitch", anchor="w",
+        # 左侧图标 + 标题文字
+        tx = 22
+        if self.banner_icon is not None:
+            try:
+                self._banner_img = self.banner_icon.subsample(5)  # ~51px
+                c.create_image(20, h / 2, image=self._banner_img, anchor="w")
+                tx = 84
+            except Exception:
+                tx = 22
+        c.create_text(tx, h / 2 - 12, text="NetSwitch", anchor="w",
                       fill="#ffffff", font=("Segoe UI", 17, "bold"))
-        c.create_text(24, h / 2 + 14, text="IP 快切 · 静态路由管理", anchor="w",
-                      fill="#dbeafe", font=("Microsoft YaHei UI", 9))
+        c.create_text(tx + 2, h / 2 + 14, text="IP 快切 · 静态路由管理",
+                      anchor="w", fill="#dbeafe",
+                      font=("Microsoft YaHei UI", 9))
 
     # ------------------------------------------------------- 路由标签页 UI
     def _build_route_tab(self):

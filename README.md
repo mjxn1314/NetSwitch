@@ -3,7 +3,7 @@
 > Windows 下的网络配置快速切换工具，图形化界面。支持 **静态 IP / DHCP 一键切换、单网卡多 IP 绑定、配置档案保存与一键应用、永久 / 临时静态路由管理**，并提供**免安装 Python 的独立 exe**。
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
-![Version](https://img.shields.io/badge/version-v1.4-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.5-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.8+-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
@@ -30,7 +30,8 @@
 
 - **独立 exe**：基于 PyInstaller 打包，单文件、无控制台、启动自动请求管理员权限，**目标电脑无需安装 Python**。
 - **配置独立存放**：配置文件保存在系统「文档」目录，不污染程序目录，便于备份。
-- **现代界面**：渐变横幅、卡片式布局、整体可滚动；操作过程无黑框 / 蓝框闪烁。
+- **专属图标**：蓝青渐变「切换」图标，同时用于 exe 图标、窗口标题栏与横幅左上角。
+- **现代界面**：渐变横幅、卡片式布局、整体可滚动；IP 设置标签与输入框整齐对齐；操作过程无黑框 / 蓝框闪烁。
 - **安全可靠**：修改基于系统原生能力，配置立即生效、无需重启网卡；设置失败不会破坏现有配置。
 
 ## 下载与安装
@@ -137,11 +138,16 @@ python ip_address_changer.py
 如需从源码自行打包为独立 exe：
 
 ```powershell
-# 安装打包工具
-pip install pyinstaller
+# 安装打包工具（生成图标另需 Pillow）
+pip install pyinstaller pillow
 
-# 打包（单文件、无控制台、自动提权）
-pyinstaller --onefile --windowed --uac-admin --name NetSwitch --clean ip_address_changer.py
+# 生成多尺寸图标
+python make_icon.py
+
+# 打包（单文件、无控制台、带图标、捆绑图标资源）
+pyinstaller --onefile --windowed --name NetSwitch --icon NetSwitch.ico `
+  --add-data "NetSwitch.ico;." --add-data "icon_256.png;." `
+  --clean ip_address_changer.py
 ```
 
 打包完成后，可执行文件位于 `dist\NetSwitch.exe`。
@@ -173,6 +179,7 @@ A：永久路由写入系统持久路由表，重启后仍然保留；临时路�
 
 ## 版本历史
 
+- **v1.5**：新增专属图标（exe / 标题栏 / 横幅）；IP 设置标签与输入框整齐对齐，界面更美观。
 - **v1.4**：新增静态路由管理（永久 / 临时路由查看、添加、删除）；配置文件迁移到系统「文档」目录；提供独立 exe；界面美化并支持整体滚动、去除操作弹窗。
 - **v1.3**：档案取消网卡绑定、可应用到任意网卡；档案右键编辑使用独立窗口；修复界面与权限相关问题。
 - **v1.0 – v1.2**：网卡枚举、静态 IP / DHCP 切换、单网卡多 IP、配置档案等基础功能。
