@@ -30,6 +30,7 @@ import base64
 import socket
 import queue
 import ctypes
+import ctypes.wintypes
 import ipaddress
 import subprocess
 import threading
@@ -588,20 +589,48 @@ class _ICMP_ECHO_REPLY(ctypes.Structure):
     ]
 
 
+# 一次性配置系统函数原型（64 位安全：避免句柄被截断为 32 位）
+_iphlp = ctypes.windll.iphlpapi
+_ws2 = ctypes.windll.ws2_32
+_iphlp.IcmpCreateFile.restype = ctypes.wintypes.HANDLE
+_iphlp.IcmpCreateFile.argtypes = []
+_iphlp.IcmpSendEcho.argtypes = [
+    ctypes.wintypes.HANDLE,   # IcmpHandle
+    ctypes.c_ulong,           # DestinationAddress（IPAddr）
+    ctypes.c_void_p,          # RequestData
+    ctypes.c_ushort,          # RequestSize
+    ctypes.c_void_p,          # RequestOptions
+    ctypes.c_void_p,          # ReplyBuffer
+    ctypes.c_ulong,           # ReplySize
+    ctypes.c_ulong,           # Timeout
+]
+_iphlp.IcmpSendEcho.restype = ctypes.c_ulong
+_iphlp.IcmpCloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+_iphlp.IcmpCloseHandle.restype = ctypes.c_long
+_iphlp.SendARP.argtypes = [
+    ctypes.c_ulong,                          # DestIP
+    ctypes.c_ulong,                          # SrcIP
+    ctypes.c_void_p,                         # MacAddr
+    ctypes.POINTER(ctypes.c_ulong),          # PhyAddrLen
+]
+_iphlp.SendARP.restype = ctypes.c_ulong
+_ws2.inet_addr.argtypes = [ctypes.c_char_p]
+_ws2.inet_addr.restype = ctypes.c_ulong
+
+
 def icmp_ping(ip, timeout=800):
     """通过 IcmpSendEcho 探测，返回 (是否存活, 往返毫秒)。"""
     try:
-        iphlp = ctypes.windll.iphlpapi
-        h = iphlp.IcmpCreateFile()
-        if h == ctypes.c_void_p(-1).value or h == 0:
+        h = _iphlp.IcmpCreateFile()
+        if not h:
             return (False, 0)
         data = b"NetSwitchAliveProbe0123456789ab"   # 32 字节
         reply_sz = ctypes.sizeof(_ICMP_ECHO_REPLY) + len(data) + 16
         buf = ctypes.create_string_buffer(reply_sz)
-        dest = ctypes.windll.ws2_32.inet_addr(ip)
-        ret = iphlp.IcmpSendEcho(h, dest, data, len(data), None,
-                                 buf, reply_sz, int(timeout))
-        iphlp.IcmpCloseHandle(h)
+        dest = _ws2.inet_addr(str(ip).encode())
+        ret = _iphlp.IcmpSendEcho(h, dest, data, len(data), None,
+                                  buf, reply_sz, int(timeout))
+        _iphlp.IcmpCloseHandle(h)
         if ret:
             reply = ctypes.cast(buf, ctypes.POINTER(_ICMP_ECHO_REPLY)).contents
             if reply.Status == 0:
@@ -639,24 +668,39 @@ def reverse_hostname(ip):
 def get_mac(ip):
     """通过 SendARP 获取同网段主机 MAC。"""
     try:
-        mac = ctypes.create_string_buffer(6)
+        mac = (ctypes.c_ubyte * 6)()
         sz = ctypes.c_ulong(6)
-        dest = ctypes.windll.ws2_32.inet_addr(ip)
-        if ctypes.windll.iphlpapi.SendARP(dest, 0, mac, ctypes.byref(sz)) == 0:
-            return "-".join(f"{b:02X}" for b in mac.raw[:6])
+        dest = _ws2.inet_addr(str(ip).encode())
+        if _iphlp.SendARP(dest, 0, mac, ctypes.byref(sz)) == 0 and sz.value >= 6:
+            return "-".join(f"{b:02X}" for b in mac[:6])
     except Exception:
         pass
     return ""
 
 
 def parse_ports(text):
+    """解析端口列表，支持单个端口与端口段（如 1-65535），支持 ; ， , 分隔。"""
     ports = []
+
+    def add(n):
+        if 0 < n < 65536 and n not in ports:
+            ports.append(n)
+
     for p in str(text).replace(";", ",").replace("，", ",").split(","):
         p = p.strip()
-        if p.isdigit():
-            n = int(p)
-            if 0 < n < 65536 and n not in ports:
-                ports.append(n)
+        if not p:
+            continue
+        if "-" in p:
+            a, b = p.split("-", 1)
+            a, b = a.strip(), b.strip()
+            if a.isdigit() and b.isdigit():
+                lo, hi = int(a), int(b)
+                if lo > hi:
+                    lo, hi = hi, lo
+                for n in range(max(1, lo), min(65535, hi) + 1):
+                    add(n)
+        elif p.isdigit():
+            add(int(p))
     return ports
 
 
@@ -712,11 +756,22 @@ def probe_host(ip, use_icmp, ports, do_name, do_mac, timeout):
 
     if ports:
         # 局域网内 TCP 单端口用较短超时，避免死主机逐个端口等待过久
-        t = max(0.2, min(0.5, timeout / 2000.0))
-        for port in ports:
-            if tcp_check(ip, port, t):
-                alive = True
-                open_ports.append(port)
+        t = max(0.1, min(0.4, timeout / 2000.0))
+        if len(ports) > 20:
+            # 端口段（如 1-65535）：单主机内并行探测，加快范围扫描
+            workers = min(64, len(ports))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(lambda p: (p, tcp_check(ip, p, t)), ports))
+            for p, ok in results:
+                if ok:
+                    alive = True
+                    open_ports.append(p)
+        else:
+            for port in ports:
+                if tcp_check(ip, port, t):
+                    alive = True
+                    open_ports.append(port)
+        open_ports.sort()
 
     name = reverse_hostname(ip) if alive and do_name else ""
     mac = get_mac(ip) if alive and do_mac else ""
@@ -801,23 +856,62 @@ def apply_static(adapter_name, primary_ip, mask, gateway, dns1, dns2, extras, lo
 # ---------------------------------------------------------------------------
 # 档案存取
 # ---------------------------------------------------------------------------
+# 扫描参数的出厂默认值（首次启动使用）
+DEFAULT_SCAN_SETTINGS = {
+    "target": "192.168.1.0/24",
+    "threads": 100,
+    "timeout": 300,
+    "icmp": True,
+    "tcp": False,
+    "ports": "80,443,22,445,3389,139",
+    "name": False,
+    "mac": False,
+    "alive_only": True,
+}
+
+
+def _read_config():
+    data = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_config(data):
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
 def load_profiles():
-    if not os.path.exists(CONFIG_PATH):
-        return []
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        profiles = data.get("profiles", [])
-        return profiles if isinstance(profiles, list) else []
-    except Exception:
-        return []
+    profiles = _read_config().get("profiles", [])
+    return profiles if isinstance(profiles, list) else []
+
+
+def load_scan_settings():
+    s = _read_config().get("scan_settings", {})
+    if not isinstance(s, dict):
+        s = {}
+    out = dict(DEFAULT_SCAN_SETTINGS)
+    out.update(s)
+    return out
 
 
 def save_profiles(profiles):
-    tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"profiles": profiles}, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONFIG_PATH)
+    data = _read_config()
+    data["profiles"] = profiles
+    _write_config(data)
+
+
+def save_scan_settings(settings):
+    data = _read_config()
+    data["scan_settings"] = settings
+    _write_config(data)
 
 
 # ---------------------------------------------------------------------------
@@ -1813,19 +1907,23 @@ class IpChangerApp(tk.Tk):
         frm_cfg = ttk.LabelFrame(tab, text=" 扫描参数 ")
         frm_cfg.pack(fill="x", padx=6, pady=(6, 3))
 
+        # 加载上次保存的扫描参数（首次启动用出厂默认）
+        self.scan_cfg = load_scan_settings()
+
         # 布尔变量（先创建，便于各控件引用）
-        self.scan_icmp = tk.BooleanVar(value=True)
-        self.scan_tcp = tk.BooleanVar(value=True)
-        self.scan_name = tk.BooleanVar(value=True)
-        self.scan_mac = tk.BooleanVar(value=True)
-        self.scan_alive_only = tk.BooleanVar(value=True)
+        self.scan_icmp = tk.BooleanVar(value=bool(self.scan_cfg.get("icmp", True)))
+        self.scan_tcp = tk.BooleanVar(value=bool(self.scan_cfg.get("tcp", False)))
+        self.scan_name = tk.BooleanVar(value=bool(self.scan_cfg.get("name", False)))
+        self.scan_mac = tk.BooleanVar(value=bool(self.scan_cfg.get("mac", False)))
+        self.scan_alive_only = tk.BooleanVar(
+            value=bool(self.scan_cfg.get("alive_only", True)))
 
         g1 = ttk.Frame(frm_cfg, style="Card.TFrame")
         g1.pack(fill="x", padx=8, pady=(5, 2))
         ttk.Label(g1, text="目标范围：", style="Card.TLabel").pack(side="left")
         self.scan_target = ttk.Entry(g1, font=("Consolas", 10))
         self.scan_target.pack(side="left", fill="x", expand=True, padx=(2, 4))
-        self.scan_target.insert(0, "192.168.1.0/24")
+        self.scan_target.insert(0, str(self.scan_cfg.get("target", "192.168.1.0/24")))
 
         g2 = ttk.Frame(frm_cfg, style="Card.TFrame")
         g2.pack(fill="x", padx=8, pady=(2, 2))
@@ -1833,12 +1931,12 @@ class IpChangerApp(tk.Tk):
         self.scan_threads = ttk.Spinbox(g2, from_=1, to=1000, width=6,
                                         font=("Consolas", 10))
         self.scan_threads.pack(side="left", padx=(2, 14))
-        self.scan_threads.set(100)
+        self.scan_threads.set(int(self.scan_cfg.get("threads", 100)))
         ttk.Label(g2, text="超时(ms)：", style="Card.TLabel").pack(side="left")
         self.scan_timeout = ttk.Spinbox(g2, from_=100, to=5000, increment=100,
                                         width=7, font=("Consolas", 10))
         self.scan_timeout.pack(side="left", padx=(2, 4))
-        self.scan_timeout.set(800)
+        self.scan_timeout.set(int(self.scan_cfg.get("timeout", 300)))
 
         g3 = ttk.Frame(frm_cfg, style="Card.TFrame")
         g3.pack(fill="x", padx=8, pady=(2, 2))
@@ -1849,7 +1947,7 @@ class IpChangerApp(tk.Tk):
                         command=self._toggle_scan_tcp).pack(side="left", padx=(0, 6))
         self.scan_ports = ttk.Entry(g3, width=24, font=("Consolas", 9))
         self.scan_ports.pack(side="left", padx=(0, 4))
-        self.scan_ports.insert(0, "80,443,22,445,3389,139")
+        self.scan_ports.insert(0, str(self.scan_cfg.get("ports", "80,443,22,445,3389,139")))
 
         g4 = ttk.Frame(frm_cfg, style="Card.TFrame")
         g4.pack(fill="x", padx=8, pady=(2, 5))
@@ -1900,7 +1998,7 @@ class IpChangerApp(tk.Tk):
         self.scan_tree.heading("ports", text="开放端口")
         self.scan_tree.column("ip", width=150, anchor="center")
         self.scan_tree.column("status", width=70, anchor="center")
-        self.scan_tree.column("host", width=180, anchor="w")
+        self.scan_tree.column("host", width=180, anchor="center")
         self.scan_tree.column("rtt", width=80, anchor="center")
         self.scan_tree.column("mac", width=150, anchor="center")
         self.scan_tree.column("ports", width=140, anchor="w")
@@ -1949,6 +2047,22 @@ class IpChangerApp(tk.Tk):
         except Exception:
             messagebox.showerror("参数错误", "线程数或超时设置无效。")
             return
+
+        # 保存本次扫描参数，下次启动自动恢复
+        try:
+            save_scan_settings({
+                "target": self.scan_target.get().strip(),
+                "threads": threads,
+                "timeout": timeout,
+                "icmp": use_icmp,
+                "tcp": self.scan_tcp.get(),
+                "ports": self.scan_ports.get().strip(),
+                "name": self.scan_name.get(),
+                "mac": self.scan_mac.get(),
+                "alive_only": self.scan_alive_only.get(),
+            })
+        except Exception:
+            pass
 
         # 重置
         self.scan_all = []
