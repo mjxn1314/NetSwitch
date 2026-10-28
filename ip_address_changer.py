@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NetSwitch（IP 快切）Windows v1.5
+NetSwitch（IP 快切）Windows v1.6
 ================================
 功能：
   1. 快速枚举网卡（CIM，约 0.5 秒），显示 IP / 掩码 / 网关 / DNS / DHCP 状态
@@ -35,7 +35,7 @@ from tkinter import ttk, messagebox
 # ---------------------------------------------------------------------------
 # 路径
 # ---------------------------------------------------------------------------
-APP_TITLE = "NetSwitch - IP 快切 v1.5"
+APP_TITLE = "NetSwitch - IP 快切 v1.6"
 ICON_ICO = "NetSwitch.ico"
 ICON_PNG = "icon_256.png"
 
@@ -70,7 +70,7 @@ def set_app_user_model_id():
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "gitee.NetSwitch.app.1.5")
+            "gitee.NetSwitch.app.1.6")
     except Exception:
         pass
 
@@ -416,17 +416,37 @@ ROUTE_MASKS = [
 ]
 
 GET_ROUTES_PS = r"""
-# 永久路由：直接读注册表 PersistentRoutes（值名格式：目标,掩码,网关）
+# 永久路由：直接读注册表 PersistentRoutes
+# 值名格式：目标,掩码,网关[,度量]（度量可空，末尾常带逗号，因此按 3 段以上解析）
 $persist = @{}
 $pr = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes' -ErrorAction SilentlyContinue
 if ($pr) {
     foreach ($prop in $pr.PSObject.Properties) {
-        if ($prop.Name -notmatch '^[^,]+,[^,]+,[^,]+$') { continue }
         $parts = $prop.Name -split ','
+        if ($parts.Count -lt 3) { continue }
         $key = ($parts[0] + '|' + $parts[1] + '|' + $parts[2])
         $persist[$key] = $true
     }
 }
+# 再合并 PersistentStore（与注册表互为补充，排除默认路由 0.0.0.0）
+try {
+    $ps2 = Get-NetRoute -AddressFamily IPv4 -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+    foreach ($r in $ps2) {
+        $dp = [string]$r.DestinationPrefix
+        $seg = $dp -split '/'
+        $dest = $seg[0]
+        if ($dest -eq '0.0.0.0') { continue }
+        $mask = ''
+        if ($seg[1] -match '^\d+$') {
+            $bits = '1' * [int]$seg[1] + '0' * (32 - [int]$seg[1])
+            $oct = @()
+            for ($i=0; $i -lt 32; $i += 8) { $oct += [string]([Convert]::ToInt32($bits.Substring($i,8),2)) }
+            $mask = $oct -join '.'
+        }
+        $key = ($dest + '|' + $mask + '|' + [string]$r.NextHop)
+        $persist[$key] = $true
+    }
+} catch {}
 
 # 活动路由（ActiveStore）
 $active = Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue
@@ -839,6 +859,171 @@ class ProfileEditDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
+# 附加 IP 编辑对话框（独立小窗口）
+# ---------------------------------------------------------------------------
+class ExtraIpEditDialog(tk.Toplevel):
+    def __init__(self, master, extra):
+        super().__init__(master)
+        self.title("编辑附加 IP")
+        self.resizable(False, False)
+        try:
+            ico = resource_path(ICON_ICO)
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+        self.result = None
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="IP 地址：").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.ip_entry = ttk.Entry(frm, width=20, font=("Consolas", 9))
+        self.ip_entry.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.ip_entry.insert(0, extra.get("ip", ""))
+
+        ttk.Label(frm, text="子网掩码：").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.mask_combo = ttk.Combobox(frm, values=COMMON_MASKS, width=18,
+                                       font=("Consolas", 9))
+        self.mask_combo.grid(row=1, column=1, sticky="w", padx=4, pady=4)
+        self.mask_combo.set(extra.get("mask", ""))
+
+        rb = ttk.Frame(frm)
+        rb.grid(row=2, column=0, columnspan=2, pady=(10, 0))
+        ttk.Button(rb, text="确定", style="Accent.TButton", width=10,
+                   command=self._ok).pack(side="right", padx=6)
+        ttk.Button(rb, text="取消", width=10, command=self.destroy).pack(side="right")
+
+        self.transient(master)
+        self.grab_set()
+        self.update_idletasks()
+        mx, my = master.winfo_rootx(), master.winfo_rooty()
+        mw, mh = master.winfo_width(), master.winfo_height()
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry("+%d+%d" % (mx + (mw - w) // 2, my + (mh - h) // 2))
+
+    def _ok(self):
+        ip = self.ip_entry.get().strip()
+        mask = self.mask_combo.get().strip()
+        if not valid_ipv4(ip):
+            messagebox.showerror("错误", "IP 格式不正确。", parent=self)
+            return
+        prefix = mask_to_prefix(mask)
+        if prefix is None:
+            messagebox.showerror("错误", "掩码不正确。", parent=self)
+            return
+        self.result = {"ip": ip, "mask": mask, "prefix": prefix}
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# 路由编辑对话框（独立小窗口）
+# ---------------------------------------------------------------------------
+class RouteEditDialog(tk.Toplevel):
+    def __init__(self, master, route, adapters):
+        super().__init__(master)
+        self.title("编辑路由")
+        self.resizable(False, False)
+        try:
+            ico = resource_path(ICON_ICO)
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+        self.result = None
+        self.adapters = adapters
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="目标网络：").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.dest_entry = ttk.Entry(frm, width=22, font=("Consolas", 9))
+        self.dest_entry.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.dest_entry.insert(0, route.get("dest", ""))
+
+        ttk.Label(frm, text="子网掩码：").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.mask_combo = ttk.Combobox(frm, values=ROUTE_MASKS, width=20,
+                                       font=("Consolas", 9))
+        self.mask_combo.grid(row=1, column=1, sticky="w", padx=4, pady=4)
+        self.mask_combo.set(route.get("mask", ""))
+
+        ttk.Label(frm, text="网关：").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.gw_entry = ttk.Entry(frm, width=22, font=("Consolas", 9))
+        self.gw_entry.grid(row=2, column=1, sticky="w", padx=4, pady=4)
+        self.gw_entry.insert(0, route.get("gw", ""))
+
+        ttk.Label(frm, text="度量值：").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        self.metric_entry = ttk.Entry(frm, width=22, font=("Consolas", 9))
+        self.metric_entry.grid(row=3, column=1, sticky="w", padx=4, pady=4)
+        self.metric_entry.insert(0, str(route.get("metric", "") or ""))
+
+        ttk.Label(frm, text="出接口网卡：").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        self.if_values = ["（自动）"]
+        for a in adapters:
+            self.if_values.append(
+                f"{a['name']} — {a['desc']} [{a['status']}]")
+        self.if_combo = ttk.Combobox(frm, values=self.if_values,
+                                     state="readonly", width=34)
+        self.if_combo.grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        self.if_combo.current(0)
+        cur_iface = route.get("iface", "")
+        for i, v in enumerate(self.if_values):
+            if i > 0 and v.startswith(cur_iface + " "):
+                self.if_combo.current(i)
+                break
+
+        self.persist_var = tk.BooleanVar(value=bool(route.get("persist", False)))
+        ttk.Checkbutton(frm, text="永久路由（重启保留）", variable=self.persist_var,
+                        style="Card.TCheckbutton").grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=4, pady=6)
+
+        rb = ttk.Frame(frm)
+        rb.grid(row=6, column=0, columnspan=2, pady=(10, 0))
+        ttk.Button(rb, text="确定", style="Accent.TButton", width=10,
+                   command=self._ok).pack(side="right", padx=6)
+        ttk.Button(rb, text="取消", width=10, command=self.destroy).pack(side="right")
+
+        self.transient(master)
+        self.grab_set()
+        self.update_idletasks()
+        mx, my = master.winfo_rootx(), master.winfo_rooty()
+        mw, mh = master.winfo_width(), master.winfo_height()
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry("+%d+%d" % (mx + (mw - w) // 2, my + (mh - h) // 2))
+
+    def _ok(self):
+        dest = self.dest_entry.get().strip()
+        mask = self.mask_combo.get().strip()
+        gw = self.gw_entry.get().strip()
+        metric = self.metric_entry.get().strip()
+        if not valid_ipv4(dest):
+            messagebox.showerror("错误", "目标网络格式不正确。", parent=self)
+            return
+        if mask_to_prefix(mask) is None:
+            messagebox.showerror("错误", "子网掩码不正确。", parent=self)
+            return
+        if not valid_ipv4(gw):
+            messagebox.showerror("错误", "网关格式不正确。", parent=self)
+            return
+        if metric and not metric.isdigit():
+            messagebox.showerror("错误", "度量值必须是数字。", parent=self)
+            return
+        if_index = None
+        if self.if_combo.current() > 0:
+            text = self.if_values[self.if_combo.current()]
+            for a in self.adapters:
+                if text.startswith(a["name"] + " "):
+                    if_index = a.get("ifIndex")
+                    break
+        self.result = {
+            "dest": dest, "mask": mask, "gw": gw,
+            "metric": metric, "if_index": if_index,
+            "persist": self.persist_var.get(),
+        }
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 # 主界面
 # ---------------------------------------------------------------------------
 class IpChangerApp(tk.Tk):
@@ -1116,7 +1301,7 @@ class IpChangerApp(tk.Tk):
         self.ip_entry = ttk.Entry(g, font=("Consolas", 9))
         self.ip_entry.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=3)
         _glabel(0, 2, "掩码：")
-        self.mask_combo = ttk.Combobox(g, values=COMMON_MASKS)
+        self.mask_combo = ttk.Combobox(g, values=COMMON_MASKS, font=("Consolas", 9))
         self.mask_combo.grid(row=0, column=3, sticky="ew", padx=(0, 14), pady=3)
         _glabel(0, 4, "网关：")
         self.gw_entry = ttk.Entry(g, font=("Consolas", 9))
@@ -1127,7 +1312,7 @@ class IpChangerApp(tk.Tk):
         self.dns1_entry.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=3)
         _glabel(1, 2, "备用 DNS：")
         self.dns2_entry = ttk.Entry(g, font=("Consolas", 9))
-        self.dns2_entry.grid(row=1, column=3, sticky="ew", pady=3)
+        self.dns2_entry.grid(row=1, column=3, sticky="ew", padx=(0, 14), pady=3)
 
         # 附加 IP
         frm_extra = ttk.LabelFrame(frm_ip, text=" 附加 IP（同一网卡绑定多个 IP，可选） ")
@@ -1154,12 +1339,21 @@ class IpChangerApp(tk.Tk):
         self.extra_tree.heading("ip", text="附加 IP 地址")
         self.extra_tree.heading("mask", text="子网掩码")
         self.extra_tree.column("ip", width=280, anchor="center")
-        self.extra_tree.column("mask", width=240, anchor="center")
+        self.extra_tree.column("mask", width=200, anchor="center")
         extra_vsb = ttk.Scrollbar(extra_wrap, orient="vertical",
                                   command=self.extra_tree.yview)
         self.extra_tree.configure(yscrollcommand=extra_vsb.set)
         extra_vsb.pack(side="right", fill="y")
         self.extra_tree.pack(side="left", fill="both", expand=True)
+        # IP 列自动拉伸
+        self._bind_tree_stretch(self.extra_tree, "ip", {"mask": 200})
+        # 右键菜单：编辑 / 删除
+        self.extra_menu = tk.Menu(self, tearoff=0)
+        self.extra_menu.add_command(label="编辑此附加 IP（修改 IP/掩码）",
+                                    command=self._on_edit_extra)
+        self.extra_menu.add_separator()
+        self.extra_menu.add_command(label="删除此附加 IP", command=self._del_extra)
+        self.extra_tree.bind("<Button-3>", self._on_extra_right_click)
 
         r3 = ttk.Frame(frm_ip, style="Card.TFrame")
         r3.pack(fill="x", padx=8, pady=(1, 6))
@@ -1214,8 +1408,11 @@ class IpChangerApp(tk.Tk):
                                  command=self.tree.yview)
         self.tree.configure(yscrollcommand=prof_vsb.set)
         prof_vsb.pack(side="right", fill="y")
-        self.tree.pack(side="left", fill="x")
+        self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda e: self._on_apply_profile())
+        # 最大化/缩放时，IP 列自动拉伸填满
+        self._bind_tree_stretch(self.tree, "ip",
+                                {"name": 130, "mode": 60, "gw": 120, "time": 130})
 
         # 右键菜单
         self.ctx_menu = tk.Menu(self, tearoff=0)
@@ -1245,9 +1442,23 @@ class IpChangerApp(tk.Tk):
     def _on_ip_canvas_config(self, event):
         # 让内部框架宽度跟随画布，保证横向填满
         self.ip_canvas.itemconfigure(self._ip_win, width=event.width)
+        # 外部最大化时，内部网格可能停留在旧宽度；强制内部框架处理待处理的布局
+        self.ip_canvas.after_idle(self.scroll_inner.update_idletasks)
 
     def _on_ip_wheel(self, event):
         self.ip_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    @staticmethod
+    def _bind_tree_stretch(tree, stretch_col, fixed):
+        """让表格的指定列随宽度自动拉伸，其余列保持固定宽度。"""
+        total_fixed = sum(fixed.values())
+
+        def on_config(event=None):
+            w = max(60, tree.winfo_width() - total_fixed)
+            if int(tree.column(stretch_col, "width")) != w:
+                tree.column(stretch_col, width=w)
+
+        tree.bind("<Configure>", on_config)
 
     # ------------------------------------------------------- 渐变横幅
     def _draw_banner(self, event=None):
@@ -1311,6 +1522,13 @@ class IpChangerApp(tk.Tk):
                       anchor="w", fill="#dbeafe",
                       font=("Microsoft YaHei UI", 9))
 
+        # 作者署名（右下角，带深色阴影保证在青色背景上可读）
+        author = "作者：李浡"
+        c.create_text(w - 17, h / 2 + 15, text=author, anchor="e",
+                      fill="#0c2b5e", font=("Microsoft YaHei UI", 9, "bold"))
+        c.create_text(w - 18, h / 2 + 14, text=author, anchor="e",
+                      fill="#ffffff", font=("Microsoft YaHei UI", 9, "bold"))
+
     # ------------------------------------------------------- 路由标签页 UI
     def _build_route_tab(self):
         tab = self.tab_route
@@ -1354,6 +1572,17 @@ class IpChangerApp(tk.Tk):
         self.route_tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.route_tree.pack(fill="both", expand=True, padx=(6, 0), pady=4)
+        # 目标网络列自动拉伸
+        self._bind_tree_stretch(
+            self.route_tree, "dest",
+            {"mask": 140, "gw": 150, "iface": 150, "metric": 70, "kind": 80})
+        # 右键菜单：编辑 / 删除
+        self.route_menu = tk.Menu(self, tearoff=0)
+        self.route_menu.add_command(label="编辑此路由（修改后自动保存）",
+                                    command=self._on_edit_route)
+        self.route_menu.add_separator()
+        self.route_menu.add_command(label="删除此路由", command=self._on_del_route)
+        self.route_tree.bind("<Button-3>", self._on_route_right_click)
 
         # 添加路由表单
         frm_add = ttk.LabelFrame(tab, text=" 添加静态路由 ")
@@ -1536,6 +1765,51 @@ class IpChangerApp(tk.Tk):
             return
         self._run_route_op(lambda: delete_route(r, self.log))
 
+    def _on_route_right_click(self, event):
+        item = self.route_tree.identify_row(event.y)
+        if item:
+            self.route_tree.selection_set(item)
+            self.route_tree.focus(item)
+            self.route_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_edit_route(self):
+        if self._busy:
+            return
+        if not is_admin():
+            messagebox.showerror("权限不足", "需要管理员权限，请使用「启动工具.bat」运行。")
+            return
+        old = self._selected_route()
+        if not old:
+            messagebox.showwarning("提示", "请先在列表中选中要编辑的路由。")
+            return
+        dlg = RouteEditDialog(self, old, self.adapters)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        n = dlg.result
+        old_kind = "永久" if old["persist"] else "临时"
+        new_kind = "永久" if n["persist"] else "临时"
+        if not messagebox.askyesno(
+            "确认修改",
+            f"将把{old_kind}路由：\n{old['dest']} / {old['mask']} → {old['gw']}\n"
+            f"修改为{new_kind}路由：\n{n['dest']} / {n['mask']} → {n['gw']}"
+            + (f"\nmetric {n['metric']}" if n["metric"] else "")
+            + "\n（自动删除旧路由并添加新路由）\n是否继续？",
+        ):
+            return
+
+        def op():
+            ok, msg = delete_route(old, self.log)
+            if not ok:
+                return False, msg
+            ok, msg = add_route(n["dest"], n["mask"], n["gw"], n["metric"],
+                                n["if_index"], n["persist"], self.log)
+            if not ok:
+                return False, msg
+            return True, ""
+
+        self._run_route_op(op)
+
     def _run_route_op(self, op):
         self.set_busy(True)
 
@@ -1645,6 +1919,36 @@ class IpChangerApp(tk.Tk):
         self.extra_ips = [e for e in self.extra_ips if e["ip"] != ip]
         self._refresh_extra_tree()
         self.log(f"已移除附加 IP：{ip}")
+
+    def _on_extra_right_click(self, event):
+        item = self.extra_tree.identify_row(event.y)
+        if item:
+            self.extra_tree.selection_set(item)
+            self.extra_tree.focus(item)
+            self.extra_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_edit_extra(self):
+        item = self.extra_tree.focus()
+        if not item:
+            messagebox.showwarning("提示", "请先选中一条附加 IP。")
+            return
+        old = next((e for e in self.extra_ips
+                    if e["ip"] == self.extra_tree.item(item, "values")[0]), None)
+        if not old:
+            return
+        dlg = ExtraIpEditDialog(self, old)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        new = dlg.result
+        # 若新 IP 与其他已存在的 IP 冲突，则拒绝
+        if new["ip"] != old["ip"] and new["ip"] in self._all_used_ips():
+            messagebox.showwarning("重复", f"IP {new['ip']} 已存在，不能修改。")
+            return
+        self.extra_ips = [new if e["ip"] == old["ip"] else e
+                          for e in self.extra_ips]
+        self._refresh_extra_tree()
+        self.log(f"已修改附加 IP：{old['ip']} → {new['ip']} / {new['mask']}")
 
     def _refresh_extra_tree(self):
         for i in self.extra_tree.get_children():
