@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NetSwitch（IP 快切）Windows v1.6
+NetSwitch（IP 快切）Windows v1.7
 ================================
 功能：
   1. 快速枚举网卡（CIM，约 0.5 秒），显示 IP / 掩码 / 网关 / DNS / DHCP 状态
@@ -10,10 +10,12 @@ NetSwitch（IP 快切）Windows v1.6
   5. 档案不绑定网卡，可对当前选定的任意网卡一键应用
   6. 档案右键菜单：编辑（独立窗口）、一键应用、删除
   7. 安全写入：netsh 即时生效，设置失败不破坏现有配置
-  8. 【静态路由】查看系统/网卡的永久、临时路由，可添加、删除永久或临时路由
+  8. 【静态路由】查看系统/网卡的永久、临时路由，可添加、删除、右键编辑
   9. 配置文件统一存放在「文档\\NetSwitch\\」，程序目录不再显示
  10. 窗口自适应屏幕大小，可自由缩放
  11. 专属图标（exe / 标题栏 / 横幅），IP 设置标签与输入框整齐对齐
+ 12. 【存活扫描】多线程快速扫描指定 IP 段（CIDR/范围），ICMP+TCP 探测、
+     主机名/MAC 解析、进度显示、结果导出
 
 注意：
   - 修改 IP / 路由需要【管理员权限】，请使用同目录下的「启动工具.bat」运行
@@ -25,17 +27,22 @@ import os
 import sys
 import json
 import base64
+import socket
+import queue
+import ctypes
+import ipaddress
 import subprocess
 import threading
+import concurrent.futures
 from datetime import datetime
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 # ---------------------------------------------------------------------------
 # 路径
 # ---------------------------------------------------------------------------
-APP_TITLE = "NetSwitch - IP 快切 v1.6"
+APP_TITLE = "NetSwitch - IP 快切 v1.7"
 ICON_ICO = "NetSwitch.ico"
 ICON_PNG = "icon_256.png"
 
@@ -70,7 +77,7 @@ def set_app_user_model_id():
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "gitee.NetSwitch.app.1.6")
+            "gitee.NetSwitch.app.1.7")
     except Exception:
         pass
 
@@ -554,6 +561,173 @@ def delete_route(route, log):
     kind = "永久" if route.get("persist") else "临时"
     log(f"已删除{kind}路由：{dest} → {gw or '任意网关'}")
     return True, ""
+
+
+# ---------------------------------------------------------------------------
+# 存活主机扫描（多线程，ICMP + TCP）
+# ---------------------------------------------------------------------------
+class _IP_OPTION_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Ttl", ctypes.c_ubyte),
+        ("Tos", ctypes.c_ubyte),
+        ("Flags", ctypes.c_ubyte),
+        ("OptionsSize", ctypes.c_ubyte),
+        ("OptionsData", ctypes.c_void_p),
+    ]
+
+
+class _ICMP_ECHO_REPLY(ctypes.Structure):
+    _fields_ = [
+        ("Address", ctypes.c_ulong),
+        ("Status", ctypes.c_ulong),
+        ("RoundTripTime", ctypes.c_ulong),
+        ("DataSize", ctypes.c_ushort),
+        ("Reserved", ctypes.c_ushort),
+        ("Data", ctypes.c_void_p),
+        ("Options", _IP_OPTION_INFO),
+    ]
+
+
+def icmp_ping(ip, timeout=800):
+    """通过 IcmpSendEcho 探测，返回 (是否存活, 往返毫秒)。"""
+    try:
+        iphlp = ctypes.windll.iphlpapi
+        h = iphlp.IcmpCreateFile()
+        if h == ctypes.c_void_p(-1).value or h == 0:
+            return (False, 0)
+        data = b"NetSwitchAliveProbe0123456789ab"   # 32 字节
+        reply_sz = ctypes.sizeof(_ICMP_ECHO_REPLY) + len(data) + 16
+        buf = ctypes.create_string_buffer(reply_sz)
+        dest = ctypes.windll.ws2_32.inet_addr(ip)
+        ret = iphlp.IcmpSendEcho(h, dest, data, len(data), None,
+                                 buf, reply_sz, int(timeout))
+        iphlp.IcmpCloseHandle(h)
+        if ret:
+            reply = ctypes.cast(buf, ctypes.POINTER(_ICMP_ECHO_REPLY)).contents
+            if reply.Status == 0:
+                return (True, int(reply.RoundTripTime))
+    except Exception:
+        pass
+    return (False, 0)
+
+
+def tcp_check(ip, port, timeout=0.8):
+    """TCP 连接探测，返回端口是否开放。"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        return s.connect_ex((ip, int(port))) == 0
+    except Exception:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def reverse_hostname(ip):
+    """反向 DNS 解析主机名。"""
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return ""
+
+
+def get_mac(ip):
+    """通过 SendARP 获取同网段主机 MAC。"""
+    try:
+        mac = ctypes.create_string_buffer(6)
+        sz = ctypes.c_ulong(6)
+        dest = ctypes.windll.ws2_32.inet_addr(ip)
+        if ctypes.windll.iphlpapi.SendARP(dest, 0, mac, ctypes.byref(sz)) == 0:
+            return "-".join(f"{b:02X}" for b in mac.raw[:6])
+    except Exception:
+        pass
+    return ""
+
+
+def parse_ports(text):
+    ports = []
+    for p in str(text).replace(";", ",").replace("，", ",").split(","):
+        p = p.strip()
+        if p.isdigit():
+            n = int(p)
+            if 0 < n < 65536 and n not in ports:
+                ports.append(n)
+    return ports
+
+
+def parse_targets(text):
+    """解析目标：支持 CIDR、范围（完整IP-完整IP 或 末段a-b）、单个 IP，逗号分隔。"""
+    ips = []
+
+    def add_range(start, end):
+        for i in range(start, end + 1):
+            ips.append(str(ipaddress.IPv4Address(i)))
+
+    for token in str(text).replace("，", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            if "/" in token:
+                net = ipaddress.ip_network(token, strict=False)
+                for ip in net.hosts():
+                    ips.append(str(ip))
+            elif "-" in token:
+                left, right = token.split("-", 1)
+                left, right = left.strip(), right.strip()
+                if "." in right:
+                    add_range(int(ipaddress.IPv4Address(left)),
+                              int(ipaddress.IPv4Address(right)))
+                else:
+                    base = left.rsplit(".", 1)[0]
+                    add_range(int(ipaddress.IPv4Address(left)),
+                              int(ipaddress.IPv4Address(f"{base}.{right}")))
+            else:
+                ips.append(str(ipaddress.IPv4Address(token)))
+        except Exception:
+            raise ValueError(f"无法解析目标：{token}")
+
+    seen, out = set(), []
+    for ip in ips:
+        if ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+    return out
+
+
+def probe_host(ip, use_icmp, ports, do_name, do_mac, timeout):
+    """探测单个主机，返回结果字典。"""
+    alive = False
+    rtt = 0
+    open_ports = []
+
+    if use_icmp:
+        ok, rtt = icmp_ping(ip, timeout)
+        alive = ok
+
+    if ports:
+        # 局域网内 TCP 单端口用较短超时，避免死主机逐个端口等待过久
+        t = max(0.2, min(0.5, timeout / 2000.0))
+        for port in ports:
+            if tcp_check(ip, port, t):
+                alive = True
+                open_ports.append(port)
+
+    name = reverse_hostname(ip) if alive and do_name else ""
+    mac = get_mac(ip) if alive and do_mac else ""
+    return {
+        "ip": ip,
+        "alive": alive,
+        "rtt": rtt,
+        "host": name,
+        "mac": mac,
+        "ports": ",".join(str(p) for p in open_ports),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1223,8 +1397,10 @@ class IpChangerApp(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.tab_ip = ttk.Frame(self.nb)
         self.tab_route = ttk.Frame(self.nb)
+        self.tab_scan = ttk.Frame(self.nb)
         self.nb.add(self.tab_ip, text="  IP 切换  ")
         self.nb.add(self.tab_route, text="  路由管理  ")
+        self.nb.add(self.tab_scan, text="  存活扫描  ")
         self.nb.pack(fill="both", expand=True, padx=6, pady=4)
 
         # 1. 网卡选择
@@ -1438,6 +1614,9 @@ class IpChangerApp(tk.Tk):
         # 路由管理标签页
         self._build_route_tab()
 
+        # 存活扫描标签页
+        self._build_scan_tab()
+
     # ------------------------------------------------- 可滚动区域
     def _on_ip_canvas_config(self, event):
         # 让内部框架宽度跟随画布，保证横向填满
@@ -1625,6 +1804,285 @@ class IpChangerApp(tk.Tk):
         self.route_buttons = [
             self.btn_route_refresh, self.btn_route_add, self.btn_route_del,
         ]
+
+    # ------------------------------------------------------- 存活扫描
+    def _build_scan_tab(self):
+        tab = self.tab_scan
+
+        # 扫描参数
+        frm_cfg = ttk.LabelFrame(tab, text=" 扫描参数 ")
+        frm_cfg.pack(fill="x", padx=6, pady=(6, 3))
+
+        # 布尔变量（先创建，便于各控件引用）
+        self.scan_icmp = tk.BooleanVar(value=True)
+        self.scan_tcp = tk.BooleanVar(value=True)
+        self.scan_name = tk.BooleanVar(value=True)
+        self.scan_mac = tk.BooleanVar(value=True)
+        self.scan_alive_only = tk.BooleanVar(value=True)
+
+        g1 = ttk.Frame(frm_cfg, style="Card.TFrame")
+        g1.pack(fill="x", padx=8, pady=(5, 2))
+        ttk.Label(g1, text="目标范围：", style="Card.TLabel").pack(side="left")
+        self.scan_target = ttk.Entry(g1, font=("Consolas", 10))
+        self.scan_target.pack(side="left", fill="x", expand=True, padx=(2, 4))
+        self.scan_target.insert(0, "192.168.1.0/24")
+
+        g2 = ttk.Frame(frm_cfg, style="Card.TFrame")
+        g2.pack(fill="x", padx=8, pady=(2, 2))
+        ttk.Label(g2, text="线程数：", style="Card.TLabel").pack(side="left")
+        self.scan_threads = ttk.Spinbox(g2, from_=1, to=1000, width=6,
+                                        font=("Consolas", 10))
+        self.scan_threads.pack(side="left", padx=(2, 14))
+        self.scan_threads.set(100)
+        ttk.Label(g2, text="超时(ms)：", style="Card.TLabel").pack(side="left")
+        self.scan_timeout = ttk.Spinbox(g2, from_=100, to=5000, increment=100,
+                                        width=7, font=("Consolas", 10))
+        self.scan_timeout.pack(side="left", padx=(2, 4))
+        self.scan_timeout.set(800)
+
+        g3 = ttk.Frame(frm_cfg, style="Card.TFrame")
+        g3.pack(fill="x", padx=8, pady=(2, 2))
+        ttk.Checkbutton(g3, text="ICMP 探测", variable=self.scan_icmp,
+                        style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(g3, text="TCP 探测", variable=self.scan_tcp,
+                        style="Card.TCheckbutton",
+                        command=self._toggle_scan_tcp).pack(side="left", padx=(0, 6))
+        self.scan_ports = ttk.Entry(g3, width=24, font=("Consolas", 9))
+        self.scan_ports.pack(side="left", padx=(0, 4))
+        self.scan_ports.insert(0, "80,443,22,445,3389,139")
+
+        g4 = ttk.Frame(frm_cfg, style="Card.TFrame")
+        g4.pack(fill="x", padx=8, pady=(2, 5))
+        ttk.Checkbutton(g4, text="解析主机名", variable=self.scan_name,
+                        style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(g4, text="获取 MAC", variable=self.scan_mac,
+                        style="Card.TCheckbutton").pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(g4, text="仅显示存活主机",
+                        variable=self.scan_alive_only,
+                        command=self._refresh_scan_tree).pack(side="left")
+
+        g5 = ttk.Frame(tab)
+        g5.pack(fill="x", padx=6, pady=2)
+        self.scan_g5 = g5
+        self.btn_scan = ttk.Button(g5, text="开始扫描", style="Accent.TButton",
+                                   width=10, command=self.start_scan)
+        self.btn_scan.pack(side="right")
+        self.btn_scan_stop = ttk.Button(g5, text="停止", width=7, state="disabled",
+                                        command=self.stop_scan)
+        self.btn_scan_stop.pack(side="right", padx=6)
+        self.btn_scan_export = ttk.Button(g5, text="导出 CSV", width=9,
+                                          command=self.export_scan)
+        self.btn_scan_export.pack(side="right", padx=6)
+        self.btn_scan_clear = ttk.Button(g5, text="清空", width=7,
+                                         command=self.clear_scan)
+        self.btn_scan_clear.pack(side="right", padx=6)
+
+        # 进度
+        gp = ttk.Frame(tab)
+        gp.pack(fill="x", padx=6, pady=(2, 2))
+        self.scan_progress = ttk.Progressbar(gp, mode="determinate")
+        self.scan_progress.pack(side="left", fill="x", expand=True)
+        self.scan_status = tk.StringVar(value="就绪")
+        ttk.Label(gp, textvariable=self.scan_status, width=34,
+                  anchor="w").pack(side="left", padx=8)
+
+        # 结果列表
+        cols = ("ip", "status", "host", "rtt", "mac", "ports")
+        frm_list = ttk.LabelFrame(tab, text=" 扫描结果 ")
+        frm_list.pack(fill="both", expand=True, padx=6, pady=(3, 6))
+        self.scan_tree = ttk.Treeview(frm_list, columns=cols, show="headings",
+                                      selectmode="browse")
+        self.scan_tree.heading("ip", text="IP 地址")
+        self.scan_tree.heading("status", text="状态")
+        self.scan_tree.heading("host", text="主机名")
+        self.scan_tree.heading("rtt", text="延迟(ms)")
+        self.scan_tree.heading("mac", text="MAC 地址")
+        self.scan_tree.heading("ports", text="开放端口")
+        self.scan_tree.column("ip", width=150, anchor="center")
+        self.scan_tree.column("status", width=70, anchor="center")
+        self.scan_tree.column("host", width=180, anchor="w")
+        self.scan_tree.column("rtt", width=80, anchor="center")
+        self.scan_tree.column("mac", width=150, anchor="center")
+        self.scan_tree.column("ports", width=140, anchor="w")
+        self.scan_tree.tag_configure("alive", foreground="#0a7a42")
+        self.scan_tree.tag_configure("dead", foreground="#94a3b8")
+        vsb = ttk.Scrollbar(frm_list, orient="vertical",
+                            command=self.scan_tree.yview)
+        self.scan_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.scan_tree.pack(fill="both", expand=True, padx=(6, 0), pady=4)
+        # IP 列自动拉伸
+        self._bind_tree_stretch(
+            self.scan_tree, "ip",
+            {"status": 70, "host": 180, "rtt": 80, "mac": 150, "ports": 140})
+
+        # 扫描状态
+        self.scan_all = []
+        self.scan_q = queue.Queue()
+        self.scan_stop_evt = threading.Event()
+        self._scanning = False
+        self._toggle_scan_tcp()
+
+    def _toggle_scan_tcp(self):
+        st = "normal" if self.scan_tcp.get() else "disabled"
+        self.scan_ports.configure(state=st)
+
+    def start_scan(self):
+        if self._scanning:
+            return
+        try:
+            targets = parse_targets(self.scan_target.get())
+        except Exception as e:
+            messagebox.showerror("目标错误", str(e))
+            return
+        if not targets:
+            messagebox.showerror("目标错误", "未解析到任何 IP。")
+            return
+        use_icmp = self.scan_icmp.get()
+        ports = parse_ports(self.scan_ports.get()) if self.scan_tcp.get() else []
+        if not use_icmp and not ports:
+            messagebox.showerror("参数错误", "请至少选择一种探测方式（ICMP 或 TCP）。")
+            return
+        try:
+            threads = max(1, min(1000, int(self.scan_threads.get())))
+            timeout = int(self.scan_timeout.get())
+        except Exception:
+            messagebox.showerror("参数错误", "线程数或超时设置无效。")
+            return
+
+        # 重置
+        self.scan_all = []
+        self.scan_q = queue.Queue()
+        self.scan_stop_evt = threading.Event()
+        self._scanning = True
+        self._refresh_scan_tree()
+        self.scan_progress.configure(maximum=len(targets), value=0)
+        self.btn_scan.configure(state="disabled")
+        self.btn_scan_stop.configure(state="normal")
+        self._set_scan_controls(False)
+        self.scan_status.set(f"扫描中… 0/{len(targets)}")
+
+        do_name, do_mac = self.scan_name.get(), self.scan_mac.get()
+
+        def worker():
+            done = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                futs = {ex.submit(probe_host, ip, use_icmp, ports,
+                                  do_name, do_mac, timeout): ip
+                        for ip in targets}
+                for fut in concurrent.futures.as_completed(futs):
+                    if self.scan_stop_evt.is_set():
+                        break
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        res = {"ip": futs[fut], "alive": False, "rtt": 0,
+                               "host": "", "mac": "", "ports": ""}
+                    self.scan_q.put(res)
+                    done += 1
+            self.scan_q.put(("__done__", done, len(targets)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(120, self._poll_scan)
+
+    def _poll_scan(self):
+        finished = False
+        alive = sum(1 for r in self.scan_all if r["alive"])
+        try:
+            while True:
+                item = self.scan_q.get_nowait()
+                if isinstance(item, tuple) and item and item[0] == "__done__":
+                    finished = True
+                    break
+                self.scan_all.append(item)
+                if item["alive"]:
+                    alive += 1
+        except queue.Empty:
+            pass
+
+        scanned = len(self.scan_all)
+        self.scan_progress.configure(value=scanned)
+        self.scan_status.set(f"已扫描 {scanned}，存活 {alive}")
+        self._refresh_scan_tree()
+
+        if finished:
+            self._finish_scan()
+        elif self._scanning:
+            self.after(150, self._poll_scan)
+
+    def _finish_scan(self):
+        self._scanning = False
+        self.scan_stop_evt.set()
+        self.btn_scan.configure(state="normal")
+        self.btn_scan_stop.configure(state="disabled")
+        self._set_scan_controls(True)
+        alive = sum(1 for r in self.scan_all if r["alive"])
+        stopped = self.scan_stop_evt.is_set() and len(self.scan_all) < self.scan_progress["maximum"]
+        if stopped:
+            self.scan_status.set(f"已停止：扫描 {len(self.scan_all)}，存活 {alive}")
+        else:
+            self.scan_status.set(f"完成：共 {len(self.scan_all)}，存活 {alive}")
+        self.log(f"存活扫描完成：扫描 {len(self.scan_all)}，存活 {alive}")
+
+    def stop_scan(self):
+        self.scan_stop_evt.set()
+        self.scan_status.set("正在停止…")
+
+    def _set_scan_controls(self, on):
+        st = "normal" if on else "disabled"
+        for w in (self.scan_target, self.scan_threads, self.scan_timeout,
+                  self.scan_ports if self.scan_tcp.get() else None):
+            if w is not None:
+                try:
+                    w.configure(state=st)
+                except Exception:
+                    pass
+
+    def _refresh_scan_tree(self):
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        rows = self.scan_all
+        if self.scan_alive_only.get():
+            rows = [r for r in rows if r["alive"]]
+        for r in sorted(rows, key=lambda x: ipaddress.IPv4Address(x["ip"])):
+            tag = "alive" if r["alive"] else "dead"
+            self.scan_tree.insert(
+                "", "end",
+                values=(r["ip"], "存活" if r["alive"] else "离线",
+                        r["host"], r["rtt"] if r["alive"] else "",
+                        r["mac"], r["ports"]),
+                tags=(tag,))
+
+    def clear_scan(self):
+        if self._scanning:
+            return
+        self.scan_all = []
+        self._refresh_scan_tree()
+        self.scan_progress.configure(value=0)
+        self.scan_status.set("就绪")
+
+    def export_scan(self):
+        if not self.scan_all:
+            messagebox.showinfo("提示", "没有可导出的结果。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            initialfile="存活扫描结果.csv")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["IP地址", "状态", "主机名", "延迟ms", "MAC", "开放端口"])
+                for r in sorted(self.scan_all,
+                                key=lambda x: ipaddress.IPv4Address(x["ip"])):
+                    w.writerow([r["ip"], "存活" if r["alive"] else "离线",
+                                r["host"], r["rtt"], r["mac"], r["ports"]])
+            self.log("扫描结果已导出：" + path)
+            messagebox.showinfo("成功", "结果已导出：\n" + path)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
 
     # ------------------------------------------------------- 路由读取/显示
     def refresh_routes(self):
